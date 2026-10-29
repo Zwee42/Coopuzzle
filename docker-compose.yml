@@ -1,0 +1,24 @@
+name: puzzle-together
+
+services:
+  puzzle-together:
+    build:
+      context: .
+    image: puzzle-together:local
+    container_name: puzzle-together
+    init: true
+    ports:
+      - "${PUZZLE_PORT:-8787}:8787"
+    environment:
+      PORT: 8787
+      HOST: 0.0.0.0
+      DATA_DIR: /app/data
+      # Set to 1 only behind a trusted reverse proxy that sets X-Forwarded-For.
+      TRUST_PROXY: "${TRUST_PROXY:-0}"
+    volumes:
+      - puzzle-data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 10s
+
+volumes:
+  puzzle-data:

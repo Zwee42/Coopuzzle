@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+  <title id="title">Golden Hour</title>
+  <desc id="desc">Layered hills and a still lake beneath a warm apricot sky.</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#efd3b1"/>
+      <stop offset=".42" stop-color="#e9b38d"/>
+      <stop offset=".72" stop-color="#c97e70"/>
+      <stop offset="1" stop-color="#8a5661"/>
+    </linearGradient>
+    <linearGradient id="lake" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b57a73"/>
+      <stop offset=".35" stop-color="#8c6268"/>
+      <stop offset="1" stop-color="#4c4b54"/>
+    </linearGradient>
+    <linearGradient id="hillBack" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9d6c6e"/>
+      <stop offset="1" stop-color="#74525f"/>
+    </linearGradient>
+    <linearGradient id="hillMid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#6c615d"/>
+      <stop offset="1" stop-color="#4e4c4b"/>
+    </linearGradient>
+    <linearGradient id="hillFront" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#45584c"/>
+      <stop offset="1" stop-color="#2e403a"/>
+    </linearGradient>
+    <radialGradient id="sunGlow" cx=".5" cy=".5" r=".5">
+      <stop offset="0" stop-color="#ffe9b7" stop-opacity=".9"/>
+      <stop offset=".38" stop-color="#ffd08d" stop-opacity=".42"/>
+      <stop offset="1" stop-color="#ffc07d" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="grain">
+      <feTurbulence type="fractalNoise" baseFrequency=".8" numOctaves="3" stitchTiles="stitch"/>
+      <feColorMatrix type="saturate" values="0"/>
+      <feComponentTransfer><feFuncA type="linear" slope=".09"/></feComponentTransfer>
+    </filter>
+    <filter id="blur24"><feGaussianBlur stdDeviation="24"/></filter>
+    <filter id="blur8"><feGaussianBlur stdDeviation="8"/></filter>
+  </defs>
+
+  <rect width="1600" height="1000" fill="url(#sky)"/>
+  <circle cx="1090" cy="330" r="290" fill="url(#sunGlow)"/>
+  <circle cx="1090" cy="330" r="93" fill="#ffe7b5"/>
+  <circle cx="1090" cy="330" r="72" fill="#fff1c9"/>
+
+  <g fill="#f7ddc3" opacity=".56" filter="url(#blur8)">
+    <ellipse cx="285" cy="238" rx="205" ry="31"/>
+    <ellipse cx="430" cy="222" rx="128" ry="22"/>
+    <ellipse cx="1320" cy="480" rx="230" ry="27"/>
+    <ellipse cx="1180" cy="522" rx="135" ry="19"/>
+  </g>
+  <g fill="#8f5d65" opacity=".52">
+    <ellipse cx="253" cy="405" rx="145" ry="17"/>
+    <ellipse cx="387" cy="389" rx="87" ry="12"/>
+    <ellipse cx="1344" cy="260" rx="120" ry="13"/>
+  </g>
+
+  <g fill="none" stroke="#634b57" stroke-width="7" stroke-linecap="round" opacity=".8">
+    <path d="M740 260c19-19 38-19 57 0"/>
+    <path d="M796 230c14-14 28-14 42 0"/>
+    <path d="M646 310c12-12 24-12 36 0"/>
+  </g>
+
+  <path d="M0 622 185 522 312 567 446 455 584 556 730 482 862 584 1010 527 1156 604 1302 489 1450 560 1600 506V760H0Z" fill="url(#hillBack)"/>
+  <path d="M0 691 148 607 286 662 408 588 562 669 716 585 892 691 1046 621 1204 690 1388 594 1600 661V820H0Z" fill="url(#hillMid)" opacity=".9"/>
+
+  <rect y="690" width="1600" height="310" fill="url(#lake)"/>
+  <g stroke-linecap="round">
+    <path d="M1150 738h167" stroke="#f5c49e" stroke-width="8" opacity=".55"/>
+    <path d="M1104 777h224" stroke="#f5c49e" stroke-width="5" opacity=".33"/>
+    <path d="M1200 818h128" stroke="#f6d4b5" stroke-width="4" opacity=".28"/>
+    <path d="M365 733h132" stroke="#e7b7a2" stroke-width="4" opacity=".25"/>
+    <path d="M540 849h180" stroke="#e7b7a2" stroke-width="5" opacity=".18"/>
+  </g>
+
+  <path d="M0 822C141 762 288 793 385 846c96 53 203 62 309 27 131-43 271-33 398 9 169 56 329 25 508-27v145H0Z" fill="url(#hillFront)"/>
+  <path d="M0 900c202-49 343-5 478 36 139 43 302 46 456 8 187-45 381-48 666 4v52H0Z" fill="#263631"/>
+  <g fill="#1f2e29">
+    <path d="m218 861 19-86 19 86zM265 878l14-64 15 64z"/>
+    <path d="m1320 850 17-74 18 74zM1369 871l13-57 13 57z"/>
+  </g>
+  <g fill="#d9b06e" opacity=".8">
+    <circle cx="179" cy="888" r="4"/><circle cx="197" cy="906" r="3"/><circle cx="1475" cy="895" r="4"/>
+    <circle cx="1500" cy="876" r="3"/><circle cx="1450" cy="916" r="3"/>
+  </g>
+  <rect width="1600" height="1000" filter="url(#grain)" opacity=".6"/>
+</svg>

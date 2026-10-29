@@ -1,0 +1,67 @@
+{
+  "name": "puzzle-together",
+  "version": "1.0.0",
+  "description": "A private, realtime jigsaw room for two.",
+  "main": "dist-server/index.js",
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c magenta,cyan \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:web": "vite --host 0.0.0.0",
+    "build": "npm run build:web && npm run build:server",
+    "build:web": "vite build",
+    "build:server": "esbuild server/index.ts --bundle --platform=node --format=esm --outfile=dist-server/index.js --packages=external --sourcemap",
+    "start": "node dist-server/index.js",
+    "preview": "npm run build && npm start",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "npm run build && node scripts/e2e.mjs",
+    "ownit": "ownit"
+  },
+  "keywords": [
+    "jigsaw",
+    "puzzle",
+    "realtime",
+    "couples"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "type": "module",
+  "private": "true",
+  "dependencies": {
+    "@fontsource-variable/dm-sans": "^5.3.0",
+    "@fontsource-variable/fraunces": "^5.3.0",
+    "express": "^5.3.0",
+    "image-size": "^2.0.4",
+    "lucide-react": "^1.61.0",
+    "multer": "^2.5.0",
+    "ownit": "^0.0.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.4",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.3.0",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@types/ws": "^8.18.2",
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
+    "esbuild": "^0.28.2",
+    "getownit": "^0.1.7",
+    "playwright": "^1.64.1",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5",
+    "vitest": "^5.0.5"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
