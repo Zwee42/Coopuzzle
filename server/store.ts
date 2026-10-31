@@ -29,6 +29,7 @@ export interface StoredPlayer {
   tokenHash: string;
   isHost: boolean;
   joinedAt: number;
+  lastSeenAt: number;
 }
 
 export interface StoredPlacement {
@@ -73,6 +74,7 @@ interface PlayerRow {
   token_hash: string;
   is_host: number;
   joined_at: number;
+  last_seen_at: number;
 }
 
 interface PlacementRow {
@@ -115,6 +117,7 @@ function mapPlayer(row: PlayerRow): StoredPlayer {
     tokenHash: row.token_hash,
     isHost: Boolean(row.is_host),
     joinedAt: row.joined_at,
+    lastSeenAt: row.last_seen_at,
   };
 }
 
@@ -167,6 +170,7 @@ export interface UpdatePuzzleInput {
 
 export class RoomStore {
   private readonly db: DatabaseSync;
+  private closed = false;
 
   constructor(dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
@@ -204,7 +208,8 @@ export class RoomStore {
         color TEXT NOT NULL,
         token_hash TEXT NOT NULL,
         is_host INTEGER NOT NULL DEFAULT 0,
-        joined_at INTEGER NOT NULL
+        joined_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL DEFAULT 0
       );
       CREATE UNIQUE INDEX IF NOT EXISTS players_token ON players(room_id, token_hash);
       CREATE INDEX IF NOT EXISTS players_room ON players(room_id);
@@ -218,9 +223,28 @@ export class RoomStore {
         PRIMARY KEY(room_id, version, piece_id)
       );
     `);
+
+    const playerColumns = this.db.prepare("PRAGMA table_info(players)").all() as unknown as Array<{
+      name: string;
+    }>;
+    if (!playerColumns.some((column) => column.name === "last_seen_at")) {
+      this.db.exec("ALTER TABLE players ADD COLUMN last_seen_at INTEGER NOT NULL DEFAULT 0");
+    }
+    // Existing databases have no per-player activity. Seed it from the room's
+    // last activity so an upgrade does not immediately transfer an active host.
+    this.db.exec(`
+      UPDATE players
+      SET last_seen_at = MAX(
+        joined_at,
+        COALESCE((SELECT updated_at FROM rooms WHERE rooms.id = players.room_id), joined_at)
+      )
+      WHERE last_seen_at = 0
+    `);
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
     this.db.close();
   }
 
@@ -258,8 +282,8 @@ export class RoomStore {
 
       this.db
         .prepare(
-          `INSERT INTO players (id, room_id, name, color, token_hash, is_host, joined_at)
-           VALUES (?, ?, ?, ?, ?, 1, ?)`,
+          `INSERT INTO players (id, room_id, name, color, token_hash, is_host, joined_at, last_seen_at)
+           VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
         )
         .run(
           input.host.id,
@@ -267,6 +291,7 @@ export class RoomStore {
           input.host.name,
           input.host.color,
           input.host.tokenHash,
+          timestamp,
           timestamp,
         );
 
@@ -336,10 +361,18 @@ export class RoomStore {
 
       this.db
         .prepare(
-          `INSERT INTO players (id, room_id, name, color, token_hash, is_host, joined_at)
-           VALUES (?, ?, ?, ?, ?, 0, ?)`,
+          `INSERT INTO players (id, room_id, name, color, token_hash, is_host, joined_at, last_seen_at)
+           VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
         )
-        .run(input.id, input.roomId, input.name, input.color, input.tokenHash, input.now);
+        .run(
+          input.id,
+          input.roomId,
+          input.name,
+          input.color,
+          input.tokenHash,
+          input.now,
+          input.now,
+        );
 
       this.db.exec("COMMIT");
     } catch (error) {
@@ -374,7 +407,98 @@ export class RoomStore {
         "INSERT OR IGNORE INTO placed_pieces (room_id, version, piece_id, placed_by, placed_at) VALUES (?, ?, ?, ?, ?)",
       )
       .run(roomId, version, pieceId, playerId, now);
+    this.touchRoom(roomId, now);
     return this.countPlacements(roomId, version);
+  }
+
+  touchRoom(roomId: string, now: number): void {
+    this.db.prepare("UPDATE rooms SET updated_at = ? WHERE id = ?").run(now, roomId);
+  }
+
+  touchPlayer(playerId: string, now: number): void {
+    this.db.prepare("UPDATE players SET last_seen_at = ? WHERE id = ?").run(now, playerId);
+  }
+
+  listImagePaths(): string[] {
+    const rows = this.db
+      .prepare("SELECT image_path FROM rooms WHERE image_path IS NOT NULL")
+      .all() as unknown as Array<{ image_path: string }>;
+    return rows.map((row) => row.image_path);
+  }
+
+  listRooms(): StoredRoom[] {
+    const rows = this.db
+      .prepare("SELECT * FROM rooms ORDER BY updated_at DESC")
+      .all() as unknown as RoomRow[];
+    return rows.map(mapRoom);
+  }
+
+  stats(): { rooms: number; players: number; placements: number } {
+    const rooms = this.db.prepare("SELECT COUNT(*) AS count FROM rooms").get() as { count: number };
+    const players = this.db.prepare("SELECT COUNT(*) AS count FROM players").get() as { count: number };
+    const placements = this.db
+      .prepare("SELECT COUNT(*) AS count FROM placed_pieces")
+      .get() as { count: number };
+    return {
+      rooms: Number(rooms.count),
+      players: Number(players.count),
+      placements: Number(placements.count),
+    };
+  }
+
+  deleteExpiredRooms(cutoff: number): StoredRoom[] {
+    const rows = this.db
+      .prepare("SELECT * FROM rooms WHERE updated_at < ? ORDER BY updated_at ASC")
+      .all(cutoff) as unknown as RoomRow[];
+    const rooms = rows.map(mapRoom);
+    for (const room of rooms) this.deleteRoom(room.id);
+    return rooms;
+  }
+
+  /**
+   * Give the room to the most recently active other member when the host has
+   * been gone for a while. A room with no active members is left for the TTL
+   * sweeper instead.
+   */
+  reassignInactiveHosts(hostCutoff: number, now: number): StoredRoom[] {
+    const rows = this.db
+      .prepare(
+        `SELECT r.* FROM rooms r
+         JOIN players p ON p.id = r.host_player_id
+         WHERE p.last_seen_at < ?
+         ORDER BY r.updated_at ASC`,
+      )
+      .all(hostCutoff) as unknown as RoomRow[];
+    const changed: StoredRoom[] = [];
+
+    for (const row of rows) {
+      const candidate = this.db
+        .prepare(
+          `SELECT id FROM players
+           WHERE room_id = ? AND id <> ? AND last_seen_at >= ?
+           ORDER BY last_seen_at DESC, joined_at ASC
+           LIMIT 1`,
+        )
+        .get(row.id, row.host_player_id, hostCutoff) as { id: string } | undefined;
+      if (!candidate) continue;
+
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        this.db.prepare("UPDATE players SET is_host = 0 WHERE room_id = ?").run(row.id);
+        this.db.prepare("UPDATE players SET is_host = 1 WHERE id = ?").run(candidate.id);
+        this.db
+          .prepare("UPDATE rooms SET host_player_id = ?, updated_at = ? WHERE id = ?")
+          .run(candidate.id, now, row.id);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        this.db.exec("ROLLBACK");
+        throw error;
+      }
+
+      const room = this.getRoomById(row.id);
+      if (room) changed.push(room);
+    }
+    return changed;
   }
 
   updatePuzzle(roomId: string, input: UpdatePuzzleInput): StoredRoom {

@@ -189,6 +189,20 @@ describe("puzzle and room lifecycle", () => {
     expect(state.notice).toMatchObject({ tone: "success", message: "A fresh puzzle is ready." });
   });
 
+  it("updates room metadata without clearing the board or locks", () => {
+    let state = connected();
+    state = gameReducer(state, { type: "grab", pieceId: "r0c0", playerId: "guest" });
+    const promoted = { ...room, hostPlayerId: "guest" };
+    state = gameReducer(state, {
+      type: "room_updated",
+      room: promoted,
+      players: players.map((player) => ({ ...player, isHost: player.id === "guest" })),
+    });
+    expect(state.room?.hostPlayerId).toBe("guest");
+    expect(state.locks).toEqual({ r0c0: "guest" });
+    expect(state.players.find((player) => player.id === "guest")?.isHost).toBe(true);
+  });
+
   it("marks the room deleted and closes the connection", () => {
     const state = gameReducer(connected(), { type: "deleted" });
     expect(state.deleted).toBe(true);

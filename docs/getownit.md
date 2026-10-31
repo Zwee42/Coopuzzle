@@ -8,7 +8,7 @@ the client, server, tests, Docker image, or runtime code.
 
 | Step | Status |
 |---|---|
-| `getownit@0.1.3` installed as a dev dependency | Done |
+| `getownit@0.1.7` installed as a dev dependency | Done |
 | `ownit login` | Done for GitHub user `Zwee42` |
 | Pre-push hook | Installed at `.git/hooks/pre-push` |
 | Model API key | **Not set** |

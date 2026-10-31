@@ -12,6 +12,7 @@ import type {
 import { createApp } from "../../server/app";
 import { RealtimeHub } from "../../server/realtime";
 import { RoomStore } from "../../server/store";
+import type { StorageLimits } from "../../server/storage";
 
 type MessageOf<T extends ServerMessage["type"]> = Extract<ServerMessage, { type: T }>;
 
@@ -24,7 +25,7 @@ export interface TestServer {
   close(): Promise<void>;
 }
 
-export async function startTestServer(): Promise<TestServer> {
+export async function startTestServer(options: { storageLimits?: StorageLimits } = {}): Promise<TestServer> {
   const dataDir = mkdtempSync(join(tmpdir(), "puzzle-together-test-"));
   const uploadsDir = join(dataDir, "uploads");
   const store = new RoomStore(dataDir);
@@ -34,6 +35,7 @@ export async function startTestServer(): Promise<TestServer> {
     hub,
     uploadsDir,
     defaultsDir: join(process.cwd(), "public", "defaults"),
+    storageLimits: options.storageLimits,
   });
   const server: Server = createServer(app);
   hub.attach(server);

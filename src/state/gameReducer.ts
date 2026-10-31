@@ -47,6 +47,7 @@ export type GameAction =
       complete: boolean;
     }
   | { type: "puzzle_started"; room: RoomDto; players: PlayerDto[] }
+  | { type: "room_updated"; room: RoomDto; players: PlayerDto[] }
   | { type: "deleted" }
   | { type: "connection"; connection: ConnectionState }
   | { type: "error"; message: string; pieceId?: string }
@@ -182,6 +183,14 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         "A fresh puzzle is ready.",
         "success",
       );
+
+    case "room_updated":
+      return {
+        ...state,
+        room: action.room,
+        players: action.players,
+        deleted: false,
+      };
 
     case "deleted":
       return { ...state, deleted: true, connection: "closed" };

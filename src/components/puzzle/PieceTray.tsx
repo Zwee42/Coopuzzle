@@ -1,8 +1,8 @@
 import { Eye, EyeOff, Maximize2, Sparkles } from "lucide-react";
-import type { PointerEvent as ReactPointerEvent } from "react";
+import { useState, type PointerEvent as ReactPointerEvent } from "react";
 import type { DragState, PlayerDto, RoomDto } from "../../../shared/protocol";
 import { type PuzzleModel, type PuzzlePiece } from "../../../shared/puzzle";
-import { cn, pluralize } from "../../lib/utils";
+import { cn } from "../../lib/utils";
 import { PuzzlePieceSvg } from "./PuzzlePieceSvg";
 import { Avatar } from "../ui/Avatar";
 
@@ -24,6 +24,24 @@ interface PieceTrayProps {
   onPiecePointerUp: (event: ReactPointerEvent<HTMLButtonElement>) => void;
   onPiecePointerCancel: (event: ReactPointerEvent<HTMLButtonElement>) => void;
   onKeyboardSelect: (piece: PuzzlePiece) => void;
+}
+
+type TrayFilter = "all" | "edges" | "corners";
+
+function isCorner(piece: PuzzlePiece, rows: number, cols: number) {
+  return (
+    (piece.row === 0 || piece.row === rows - 1) &&
+    (piece.col === 0 || piece.col === cols - 1)
+  );
+}
+
+function isEdge(piece: PuzzlePiece, rows: number, cols: number) {
+  return (
+    piece.row === 0 ||
+    piece.row === rows - 1 ||
+    piece.col === 0 ||
+    piece.col === cols - 1
+  );
 }
 
 function fittedSize(base: number, aspect: number) {
@@ -51,12 +69,17 @@ export function PieceTray({
   onPiecePointerCancel,
   onKeyboardSelect,
 }: PieceTrayProps) {
+  const [filter, setFilter] = useState<TrayFilter>("all");
   const playerMap = new Map(players.map((player) => [player.id, player]));
   const loosePieces = puzzle.trayOrder
     .filter((pieceId) => !placed[pieceId])
     .map((pieceId) => puzzle.piecesById.get(pieceId))
     .filter((piece): piece is PuzzlePiece => Boolean(piece));
-  const visiblePieces = loosePieces.filter((piece) => {
+  const edgePieces = loosePieces.filter((piece) => isEdge(piece, puzzle.rows, puzzle.cols));
+  const cornerPieces = loosePieces.filter((piece) => isCorner(piece, puzzle.rows, puzzle.cols));
+  const filteredPieces =
+    filter === "edges" ? edgePieces : filter === "corners" ? cornerPieces : loosePieces;
+  const visiblePieces = filteredPieces.filter((piece) => {
     const drag = drags[piece.id];
     // Keep our own dragged piece mounted so pointer capture survives the server echo.
     return !drag || drag.playerId === you;
@@ -110,16 +133,42 @@ export function PieceTray({
               style={{ width: `${percent}%` }}
             />
           </div>
-          <div className="mt-2 flex items-center justify-between gap-2">
-            <p className="text-[0.72rem] text-cocoa-soft">
-              {loosePieces.length === 0
-                ? "Every piece is home."
-                : `${loosePieces.length} ${pluralize(loosePieces.length, "piece")} left`}
-            </p>
+          <div className="mt-2 flex items-center gap-1">
+            <div
+              className="flex min-w-0 items-center gap-0.5 rounded-full bg-cocoa/[0.045] p-0.5"
+              role="group"
+              aria-label="Filter loose pieces"
+            >
+              {(
+                [
+                  ["all", "All", loosePieces.length],
+                  ["edges", "Edges", edgePieces.length],
+                  ["corners", "Corners", cornerPieces.length],
+                ] as const
+              ).map(([value, label, count]) => (
+                <button
+                  key={value}
+                  type="button"
+                  data-testid={`tray-filter-${value}`}
+                  onClick={() => setFilter(value)}
+                  aria-pressed={filter === value}
+                  className={cn(
+                    "rounded-full px-1.5 py-1 text-[0.6rem] font-medium outline-none transition focus-visible:ring-2 focus-visible:ring-rosewood",
+                    filter === value
+                      ? "bg-white/80 text-cocoa shadow-sm"
+                      : "text-cocoa-soft hover:text-cocoa",
+                  )}
+                  title={`Show ${label.toLowerCase()} loose pieces`}
+                >
+                  {label}
+                  <span className="ml-0.5 tabular-nums opacity-65">{count}</span>
+                </button>
+              ))}
+            </div>
             <button
               type="button"
               onClick={onToggleGuide}
-              className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[0.68rem] font-medium text-cocoa-soft outline-none transition hover:bg-cocoa/[0.05] hover:text-cocoa focus-visible:ring-2 focus-visible:ring-rosewood"
+              className="ml-auto inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-1 text-[0.68rem] font-medium text-cocoa-soft outline-none transition hover:bg-cocoa/[0.05] hover:text-cocoa focus-visible:ring-2 focus-visible:ring-rosewood"
               aria-pressed={guideVisible}
               title={guideVisible ? "Hide the picture guide" : "Show the picture guide"}
             >
@@ -137,8 +186,7 @@ export function PieceTray({
       <div className="relative min-h-0 flex-1">
         {visiblePieces.length > 0 ? (
           <div
-            className="tray-scroll flex h-full gap-2 overflow-x-auto overflow-y-hidden pb-1 lg:grid lg:grid-cols-3 lg:content-start lg:overflow-y-auto lg:overflow-x-hidden lg:pr-1"
-            style={{ touchAction: "pan-x" }}
+            className="tray-scroll flex h-full touch-pan-x gap-2 overflow-x-auto overflow-y-hidden pb-1 lg:grid lg:grid-cols-3 lg:content-start lg:touch-pan-y lg:overflow-y-auto lg:overflow-x-hidden lg:pr-1"
           >
             {visiblePieces.map((piece) => {
               const lockOwnerId = locks[piece.id];
@@ -155,15 +203,17 @@ export function PieceTray({
                   aria-pressed={selected}
                   aria-disabled={lockedByOther}
                   title={lockedByOther ? `${lockOwner?.name} is holding this piece` : "Drag to the board, or select then tap the board"}
-                  onPointerDown={(event) => onPiecePointerDown(event, piece)}
+                  onPointerDown={
+                    lockedByOther ? undefined : (event) => onPiecePointerDown(event, piece)
+                  }
                   onPointerMove={onPiecePointerMove}
                   onPointerUp={onPiecePointerUp}
                   onPointerCancel={onPiecePointerCancel}
                   onClick={(event) => {
-                    if (event.detail === 0) onKeyboardSelect(piece);
+                    if (!lockedByOther && event.detail === 0) onKeyboardSelect(piece);
                   }}
                   className={cn(
-                    "group relative grid h-[78px] w-[78px] shrink-0 place-items-center rounded-2xl border bg-white/35 p-1.5 outline-none transition duration-200 lg:h-[84px] lg:w-full",
+                    "tray-piece group relative grid h-[78px] w-[78px] shrink-0 place-items-center rounded-2xl border bg-white/35 p-1.5 outline-none transition duration-200 lg:h-[84px] lg:w-full",
                     "focus-visible:ring-2 focus-visible:ring-rosewood focus-visible:ring-offset-1 focus-visible:ring-offset-[#fbf6ed]",
                     selected
                       ? "border-rosewood/60 bg-blush/70 shadow-[0_0_0_3px_rgba(185,95,84,0.1)]"
@@ -198,8 +248,20 @@ export function PieceTray({
           </div>
         ) : (
           <div className="flex h-full min-h-[90px] flex-col items-center justify-center rounded-2xl border border-dashed border-cocoa/15 px-5 text-center">
-            <span className="font-display text-lg text-cocoa">All together now.</span>
-            <span className="mt-1 text-xs text-cocoa-soft">Every piece has found its place.</span>
+            <span className="font-display text-lg text-cocoa">
+              {loosePieces.length === 0
+                ? "All together now."
+                : filteredPieces.length === 0
+                  ? `No ${filter === "corners" ? "corner" : "edge"} pieces left.`
+                  : "Those pieces are being moved."}
+            </span>
+            <span className="mt-1 text-xs text-cocoa-soft">
+              {loosePieces.length === 0
+                ? "Every piece has found its place."
+                : filteredPieces.length === 0
+                  ? "Try another filter, or place the rest from All."
+                  : "They will reappear when the other player lets go."}
+            </span>
           </div>
         )}
       </div>

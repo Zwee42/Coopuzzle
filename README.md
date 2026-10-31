@@ -4,7 +4,8 @@
 
 A private, persistent, realtime jigsaw room for two — with room for four. One person creates a
 room, picks one of four original illustrations or uploads a photo, and chooses a piece count. The
-room lives at an unlisted invite link until its host deletes it. No accounts, no timers, no scores.
+room lives at an unlisted invite link until its host deletes it or it sits unused for 30 days. No
+accounts, no timers, no scores.
 
 Pieces can be dragged or tap-selected into place. Every grab, drag, placement and cursor is shared
 over one WebSocket, and the board is saved in SQLite so it is still there after a refresh, a server
@@ -15,13 +16,19 @@ restart, or a long pause for tea.
 - Shared realtime board with server-authoritative piece locks, drag ghosts and live cursors.
 - Private rooms with 7-character codes and invite links. Rooms are never listed publicly.
 - Up to 4 players, each with a display name and colour. The creator is the host.
-- Four bundled SVG illustrations or JPEG/PNG/WebP uploads, resized in the browser before upload.
+- Four bundled SVG illustrations or JPEG/PNG/WebP uploads, resized in the browser and re-encoded on
+  the server (which strips EXIF/GPS metadata).
 - Exact piece counts: **12, 24, 48, 80, 120, 200, 300**.
 - Classic interlocking pieces generated deterministically from a room seed. No rotation.
 - A tray of loose pieces; a piece dropped within `0.9` of a cell of its home slot snaps and locks.
 - Persistent SQLite state, uploaded images on local disk, and automatic rejoin with a saved token.
 - Host-only room deletion, any-player restart/change with a confirmation dialog.
 - Responsive layout for phones, tablets and desktop, plus reduced-motion support.
+- Board zoom/pan, a floating reference picture, and All/Edges/Corners tray filters.
+- Scannable QR invite codes and a full reference-picture dialog.
+- Retention and host recovery: inactive rooms expire after 30 days, and a quiet host is replaced by
+  the most recently active member after 14 days.
+- Per-room and global upload budgets, orphan-file cleanup, structured JSON logs and optional metrics.
 - Single Node process serving the SPA, REST API, uploads and WebSocket.
 
 ## Stack
@@ -31,8 +38,8 @@ restart, or a long pause for tea.
 | UI | React 19, Vite 8, TypeScript, Tailwind CSS 4 |
 | Server | Node.js, Express 5, `ws` |
 | Persistence | Node's built-in `node:sqlite` (SQLite, WAL mode) |
-| Images | `multer` + `image-size`; bundled SVGs and local uploads |
-| Tests | Vitest, Node test server, Playwright two-browser e2e |
+| Images | `multer` + `sharp` (validation, auto-orient, resize, metadata stripping) |
+| Tests | Vitest, Node test server, Playwright multi-browser e2e |
 | Dev tooling | `getownit` (not imported or used at runtime) |
 
 ## Quick start
@@ -70,15 +77,25 @@ Open <http://localhost:8787>. `npm start` serves `dist/` and `dist-server/` from
 | `npm run build` | Build the SPA into `dist/` and the server into `dist-server/`. |
 | `npm start` | Run the built server (serves the SPA too). |
 | `npm run typecheck` | Type-check the client and server projects. |
-| `npm test` | Run the Vitest core, store, reducer and server/WebSocket tests. |
+| `npm test` | Run the Vitest core, store, reducer, storage, backup and server/WebSocket tests. |
 | `npm run test:watch` | Run Vitest in watch mode. |
-| `npm run e2e` | Build, then run the two-browser Playwright flow. |
+| `npm run e2e` | Build, then run the Playwright flow (4 players, reconnect, zoom, QR). |
+| `npm run admin -- list` | List rooms from the maintenance CLI. |
+| `npm run admin -- delete <code>` | Delete a room and its upload (stop the server first). |
+| `npm run admin -- prune` | Delete expired rooms and orphaned uploads. |
+| `npm run admin -- stats` | Print room counts and upload disk usage. |
+| `npm run admin:dev -- list` | Run the same CLI from TypeScript without building. |
+| `npm run backup` | Snapshot SQLite and uploads into `backups/` (safe while running). |
+| `npm run restore -- <dir>` | Restore a backup (stop the server first). |
 | `npm run ownit` | Run the `getownit` CLI from this repo. |
+
+The `admin` script uses `dist-server`; run `npm run build` first in a fresh checkout, or use
+`npm run admin:dev` while developing. The backup and restore scripts run directly from `scripts/`.
 
 ## Configuration
 
-Copy `.env.example` to `.env` for local use. The server loads `.env` when it starts; real
-environment variables can also be supplied by the shell or Docker.
+Copy `.env.example` to `.env` for local use. The server, admin CLI and backup/restore scripts load
+`.env` when they start; real environment variables can also be supplied by the shell or Docker.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -86,12 +103,25 @@ environment variables can also be supplied by the shell or Docker.
 | `HOST` | `0.0.0.0` | Interface to bind. Use `127.0.0.1` behind a local proxy. |
 | `DATA_DIR` | `./data` | SQLite database and `uploads/` directory. |
 | `TRUST_PROXY` | unset | Set to `1` only behind a trusted reverse proxy that sets `X-Forwarded-For`. |
+| `ROOM_TTL_DAYS` | `30` | Delete a room after this many days without activity. `0` disables expiry. |
+| `HOST_TRANSFER_DAYS` | `14` | Give host rights to the most recently active member after the host is gone this long. `0` disables. |
+| `MAINTENANCE_INTERVAL_MINUTES` | `60` | How often retention, host recovery and orphan cleanup run (minimum 1). |
+| `ORPHAN_UPLOAD_GRACE_HOURS` | `24` | Age before an unreferenced upload file is deleted. `0` disables cleanup. |
+| `MAX_TOTAL_UPLOAD_MB` | `2048` | Global disk budget for uploaded room images. |
+| `MAX_ROOM_UPLOAD_MB` | `24` | Per-room upload budget (the current image, not lifetime uploads). |
+| `METRICS_TOKEN` | unset | If set, `GET /api/metrics` requires `Authorization: Bearer <token>`. |
+| `HSTS` | unset | Set to `1` behind HTTPS to send `Strict-Transport-Security`. |
+| `LOG_LEVEL` | unset | Set to `silent` to suppress structured server logs. |
 
 In development, keep `PORT=8787` unless you also update the proxy target in `vite.config.ts`.
 `CHROMIUM_PATH` is an optional e2e-only override for the browser executable.
 
-There are no secrets or third-party API keys in the app. The `getownit` API key is only for the
-developer debrief tool and is stored outside the app in `~/.ownit/config.json`.
+All limits are per process. Rate-limit buckets and realtime locks live in memory, which is another
+reason to run a single app instance.
+
+The app ships with no secrets or third-party API keys. `METRICS_TOKEN` is optional and supplied by
+the environment. The `getownit` API key is only for the developer debrief tool and is stored outside
+the app in `~/.ownit/config.json`.
 
 ## Docker
 
@@ -123,6 +153,15 @@ The image runs as the non-root `node` user, exposes a `HEALTHCHECK` against `/ap
 stores everything under `/app/data`. The SQLite database is `puzzle-together.db`; uploaded photos
 are in `uploads/`.
 
+Maintenance commands can run inside the image while the service is stopped:
+
+```bash
+docker compose stop
+docker compose run --rm puzzle-together node dist-server/admin.js list
+docker compose run --rm puzzle-together node dist-server/admin.js prune
+docker compose start
+```
+
 ### Reverse proxy
 
 Put the container behind a TLS-terminating reverse proxy and forward WebSocket upgrades for `/ws`.
@@ -151,8 +190,21 @@ puzzle.example.com {
    removed, and everyone is sent back to the home page.
 
 Piece locks are owned by a socket, not a player, so closing a tab immediately releases whatever
-that tab was holding. A 30-second heartbeat reaps dead connections, and cursors disappear after
-4.5 seconds without movement.
+that tab was holding. A 10-second heartbeat reaps dead connections, and cursors disappear after
+4.5 seconds without movement. The browser reconnects immediately when the network returns or the
+tab becomes visible, instead of waiting for the next backoff tick.
+
+### Retention and host recovery
+
+The maintenance loop runs at startup and then hourly. A room whose `updated_at` is older than
+`ROOM_TTL_DAYS` is deleted, its upload removed, and any connected players are told the room closed.
+Opening a room, joining, placing a piece or changing the puzzle counts as activity; previews do not.
+
+If the host has not connected for `HOST_TRANSFER_DAYS` and another member has been active within
+that window, the most recently active member becomes host. Everyone receives a `room_updated`
+message, and the board, placements and locks are left untouched. If no member is active, the room is
+left for the TTL sweeper. For a completely orphaned room, stop the server and use
+`npm run admin -- delete <code>` (or `prune`).
 
 ## Architecture
 
@@ -163,18 +215,23 @@ shared/                 Pure contracts and puzzle logic (no React, DOM or Node)
   difficulty.ts         Presets, capacity, colours, snap tolerance
 server/
   index.ts              Process bootstrap, static serving, graceful shutdown
-  app.ts                REST routes, upload validation, rate limits, SPA fallback
+  app.ts                REST routes, upload validation, rate limits, CSP, SPA fallback
   realtime.ts           Authoritative WebSocket hub, locks, drags, placements, presence
-  store.ts              SQLite schema and room/player/placement queries
-  images.ts             Upload parsing, MIME/dimension checks, file cleanup
+  store.ts              SQLite schema, rooms/players/placements, retention and host transfer
+  images.ts             Upload validation, auto-orient, resize, re-encode, file cleanup
+  storage.ts            Disk budgets and orphaned-upload pruning
+  maintenance.ts        Background retention, host recovery and cleanup loop
+  log.ts                Structured JSON logger
+  admin.ts              Offline list/delete/prune/stats CLI
   session.ts            Codes, tokens, hashing, DTO mapping
 src/
   pages/                Landing, create, join, room
   components/           Board, tray, dialogs, artwork, UI primitives
   state/                Pure client room reducer
   realtime/             WebSocket adapter and reconnect effects
-tests/                  Core, store, reducer and server/WebSocket tests
-scripts/e2e.mjs         Two-browser end-to-end flow
+tests/                  Core, store, reducer, storage, backup and server/WebSocket tests
+scripts/e2e.mjs         Playwright end-to-end flow
+scripts/backup.mjs      Consistent SQLite + uploads snapshot and restore helpers
 ```
 
 The important boundary: `shared/` and `src/state/` are pure. The WebSocket hook and REST adapters
@@ -187,6 +244,7 @@ cannot place a piece from an old puzzle or move a piece it does not hold.
 |---|---|
 | `GET /api/health` | Liveness check used by Docker. |
 | `GET /api/default-images` | The four bundled illustrations. |
+| `GET /api/metrics` | Optional bearer-token operational metrics: rooms, players, placements, sockets, locks and disk usage. |
 | `POST /api/rooms` | Create a room. Multipart: `hostName`, `roomName`, `pieceCount`, `imageKind` (`default` or `upload`), `defaultImageId`, or `image`. |
 | `GET /api/rooms/:code/preview` | Name, host, image and piece count for the join screen. |
 | `POST /api/rooms/:code/join` | Join or resume. JSON: `name`, optional `token`. |
@@ -197,8 +255,8 @@ cannot place a piece from an old puzzle or move a piece it does not hold.
 
 The socket starts with `{ type: "hello", code, token }`. The server replies with a `snapshot`, then
 broadcasts `players`, `cursor`, `piece_grabbed`, `piece_released`, `piece_drag`, `piece_drag_off`,
-`piece_placed`, `puzzle_started` and `room_deleted` messages. Every mutation carries the puzzle
-`version`; invalid piece IDs, coordinates, versions and locks are rejected.
+`piece_placed`, `puzzle_started`, `room_updated` and `room_deleted` messages. Every mutation carries
+the puzzle `version`; invalid piece IDs, coordinates, versions and locks are rejected.
 
 ## Data and backups
 
@@ -212,9 +270,36 @@ data/
   uploads/                Uploaded JPEG/PNG/WebP files
 ```
 
-To take a consistent backup, stop the server or container first, then copy the whole directory (or
-the named Docker volume). Copying only the `.db` file while WAL mode is active can miss recent
-commits. Uploads must be backed up with the database because room rows reference their filenames.
+### Automated local backups
+
+`npm run backup` uses SQLite's `serialize()` to take a consistent snapshot while the server is
+running, then copies `uploads/` and writes a manifest. Backups go to `backups/` by default:
+
+```bash
+npm run backup
+# Backup written to /path/to/puzzletogether/backups/puzzle-together-2026-10-30T...
+
+# Or choose a directory outside DATA_DIR.
+npm run backup -- /mnt/backups/puzzle-together-2026-10-30
+```
+
+Run it from cron daily (the server can stay up):
+
+```cron
+15 3 * * * cd /srv/puzzletogether && DATA_DIR=/srv/puzzletogether/data npm run backup >> /var/log/puzzle-backup.log 2>&1
+```
+
+Restore with the server stopped:
+
+```bash
+npm run restore -- backups/puzzle-together-2026-10-30T03-15-00-000Z
+```
+
+Uploads must be backed up with the database because room rows reference their filenames. Uploaded
+images are private photos: treat backups with the same care as the originals. Prune old backup
+directories on whatever schedule suits your disk.
+
+### Docker volume backup
 
 ```bash
 docker compose stop
@@ -224,7 +309,7 @@ docker compose start
 ```
 
 Restore by stopping the service, replacing the volume contents from the archive, and starting it
-again. Uploaded images are private photos: treat backups with the same care as the originals.
+again.
 
 ## Testing
 
@@ -237,17 +322,20 @@ npm run e2e
 `npm test` covers:
 
 - deterministic piece generation, grid selection, exact counts, tray order and snapping;
-- SQLite persistence, room capacity, puzzle versions and placement queries;
-- the pure client room reducer;
-- REST validation, uploads, rate-limit-sensitive paths, WebSocket locks, drags, misses,
-  placements, completion, presence, restart/stale versions and deletion.
+- SQLite persistence, capacity, versions, TTL expiry, host transfer and placement queries;
+- the pure client room reducer, including `room_updated` without board resets;
+- upload budgets, orphan cleanup and backup/restore round-trips;
+- REST validation, EXIF stripping, CSP/security headers, metrics auth, preview rate limits,
+  WebSocket locks, drags, misses, placements, completion, presence, restart/stale versions and
+  deletion.
 
 `npm run e2e` builds first, starts a throwaway server on a free port with a temporary `DATA_DIR`,
-and drives two isolated Chromium contexts through:
+and drives isolated Chromium contexts through:
 
-> create → invite → join → presence → drag ghost/cursor → drag placement → tap placement →
-> refresh/rejoin → responsive widths → restart → complete all 12 pieces → celebration → host
-> delete → both redirect → 404
+> create → invite → join → presence → same-token second tab → fill all four seats → reject a
+> fifth → QR invite → zoom/pan/reference/filter → server restart while holding a piece → drag
+> ghost/cursor → drag placement → tap placement → refresh/rejoin → responsive widths → restart →
+> complete all 12 pieces → celebration → host delete → everyone redirects → 404
 
 It writes screenshots to `test-results/e2e/` (gitignored). It uses `/usr/bin/chromium` when
 present, Playwright's browser otherwise, or `CHROMIUM_PATH=/path/to/chrome`.
@@ -285,20 +373,30 @@ later. See [`docs/getownit.md`](docs/getownit.md) for the full notes.
   the durable state. Horizontal scaling would need a shared lock/broadcast layer.
 - Terminate TLS at a reverse proxy and forward WebSocket upgrades. Keep the data volume on
   persistent storage with enough room for uploaded photos.
-- `/api/health` is the container health endpoint. Graceful shutdown closes the hub, server and
-  SQLite connection on `SIGINT`/`SIGTERM`.
-- Uploads are capped at 12 MB on the server and the client downscales photos to 2400 px on the
-  long edge. JPEG, PNG and WebP are accepted; content and dimensions are checked.
-- The server sets `noindex`, `nosniff`, `DENY` framing and a restrictive permissions policy.
-  Room creation/join/upload routes have per-process rate limits.
+- `/api/health` is the container health endpoint. Graceful shutdown closes maintenance, the hub,
+  the HTTP server and SQLite on `SIGINT`/`SIGTERM`.
+- Uploads are capped at 12 MB on the server. The client downscales photos to 2400 px; the server
+  auto-orients, downscales to 2400 px, re-encodes and strips EXIF/GPS metadata. JPEG, PNG and WebP
+  are accepted; content, dimensions, animation and actual format are checked.
+- Global and per-room upload budgets are enforced before writing. A maintenance loop deletes
+  unreferenced upload files after a grace period.
+- The server sets a restrictive CSP, `noindex`, `nosniff`, `DENY` framing, COOP/CORP and a
+  permissions policy. Set `HSTS=1` only when TLS terminates in front of the app.
+- Room creation/join/upload/preview routes have per-process rate limits.
+- Server logs are JSON lines with request IDs, status, duration, room lifecycle, host transfers and
+  WebSocket closes. Set `METRICS_TOKEN` to expose `/api/metrics` for a scraper.
+- `.github/workflows/ci.yml` runs typecheck, unit/integration tests, build and the full Playwright
+  flow on every push and pull request.
 
 ## Privacy and limits
 
 Rooms are unlisted and never appear in a gallery, but they are not encrypted end-to-end. Anyone
 with the invite link or room code can open the join screen, and anyone with an uploaded image URL
 can fetch that image. Use TLS, keep links within your group, and delete rooms when you are done.
-The host is the only person who can delete a room.
+The host is the only person who can delete a room. The server re-encodes uploads to remove camera
+metadata, but it cannot stop someone who already has the image URL from viewing the photo.
 
-This version does not include accounts, chat, piece rotation, zoom/pan, cropping before upload,
-public discovery, notifications, or multi-instance/S3 deployment. See `PLAN.md` for the full scope
+This version does not include accounts, chat, piece rotation, cropping before upload, public
+discovery, notifications, or multi-instance/S3 deployment. It also does not encrypt uploads at
+rest; use full-disk encryption if that matters for your deployment. See `PLAN.md` for the full scope
 and acceptance criteria.

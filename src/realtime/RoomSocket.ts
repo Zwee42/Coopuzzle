@@ -20,12 +20,37 @@ export class RoomSocket {
   private attempts = 0;
   private reconnectTimer: number | null = null;
 
+  private readonly handleWake = () => {
+    if (this.stopped) return;
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
+    this.attempts = 0;
+    this.clearReconnect();
+    this.connect();
+  };
+
+  private readonly handleVisibility = () => {
+    if (document.visibilityState === "visible") this.handleWake();
+  };
+
   constructor(options: RoomSocketOptions) {
     this.options = options;
+    window.addEventListener("online", this.handleWake);
+    document.addEventListener("visibilitychange", this.handleVisibility);
   }
 
   connect(): void {
     if (this.stopped) return;
+    if (
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
     this.clearReconnect();
     this.options.onStatus(this.attempts === 0 ? "connecting" : "reconnecting");
     let ws: WebSocket;
@@ -38,7 +63,10 @@ export class RoomSocket {
     this.ws = ws;
 
     ws.addEventListener("open", () => {
-      if (this.stopped) return;
+      if (this.stopped || this.ws !== ws) {
+        ws.close();
+        return;
+      }
       this.attempts = 0;
       this.options.onStatus("open");
       this.send({
@@ -49,6 +77,7 @@ export class RoomSocket {
     });
 
     ws.addEventListener("message", (event) => {
+      if (this.ws !== ws) return;
       if (typeof event.data !== "string") return;
       let payload: unknown;
       try {
@@ -67,6 +96,7 @@ export class RoomSocket {
     });
 
     ws.addEventListener("close", (event) => {
+      if (this.ws !== ws) return;
       this.ws = null;
       if (this.stopped) {
         this.options.onStatus("closed");
@@ -87,15 +117,25 @@ export class RoomSocket {
 
   send(message: ClientMessage): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
-    this.ws.send(JSON.stringify(message));
-    return true;
+    try {
+      this.ws.send(JSON.stringify(message));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   close(): void {
     this.stopped = true;
     this.clearReconnect();
+    window.removeEventListener("online", this.handleWake);
+    document.removeEventListener("visibilitychange", this.handleVisibility);
     if (this.ws) {
-      this.ws.close(1000, "Leaving room");
+      try {
+        this.ws.close(1000, "Leaving room");
+      } catch {
+        // Already closing.
+      }
       this.ws = null;
     }
   }

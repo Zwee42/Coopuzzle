@@ -8,6 +8,7 @@ import { DEFAULT_IMAGES, defaultImageById } from "../shared/defaults";
 import type { ApiErrorBody, ImageKind, RoomImage, RoomPreview } from "../shared/protocol";
 import { selectGrid } from "../shared/puzzle";
 import { InvalidImageError, removeUpload, storeImageUpload } from "./images";
+import { logger } from "./log";
 import { RealtimeHub } from "./realtime";
 import {
   bearerToken,
@@ -22,6 +23,14 @@ import {
   playerSession,
   roomDto,
 } from "./session";
+import {
+  assertUploadFits,
+  directorySize,
+  StorageLimitError,
+  storageLimitsFromEnv,
+  withStorageLock,
+  type StorageLimits,
+} from "./storage";
 import { RoomFullError, RoomStore, type StoredPlayer, type StoredRoom } from "./store";
 
 const MAX_UPLOAD_BYTES = 12 * 1024 * 1024;
@@ -33,6 +42,7 @@ export interface AppDependencies {
   uploadsDir: string;
   defaultsDir?: string;
   staticDir?: string;
+  storageLimits?: StorageLimits;
 }
 
 class ApiError extends Error {
@@ -83,6 +93,7 @@ async function resolveImage(
   body: unknown,
   file: Express.Multer.File | undefined,
   uploadsDir: string,
+  limits: StorageLimits,
   currentRoom?: StoredRoom,
 ): Promise<{ image: RoomImage; filename: string | null; newUpload: boolean }> {
   const kind = field(body, "imageKind");
@@ -93,7 +104,17 @@ async function resolveImage(
   const parsedKind = parseImageKind(kind);
   if (parsedKind === "upload") {
     if (!file) apiError(400, "missing_image", "Choose a photo to upload.");
-    const stored = await storeImageUpload(file.buffer, file.mimetype, uploadsDir);
+    const stored = await withStorageLock(() =>
+      storeImageUpload(file.buffer, file.mimetype, uploadsDir, {
+        beforeWrite: (bytes) =>
+          assertUploadFits({
+            uploadsDir,
+            incomingBytes: bytes,
+            replaceFile: currentRoom?.imagePath ?? null,
+            limits,
+          }),
+      }),
+    );
     return { image: stored.image, filename: stored.filename, newUpload: true };
   }
 
@@ -161,6 +182,7 @@ function sendError(response: Response, status: number, code: string, message: st
 
 export function createApp(deps: AppDependencies) {
   const { store, hub, uploadsDir, defaultsDir, staticDir } = deps;
+  const limits = deps.storageLimits ?? storageLimitsFromEnv();
   const app = express();
   app.disable("x-powered-by");
   if (process.env.TRUST_PROXY === "1") app.set("trust proxy", 1);
@@ -176,13 +198,50 @@ export function createApp(deps: AppDependencies) {
   const createLimiter = rateLimit(12, 60_000);
   const joinLimiter = rateLimit(40, 60_000);
   const uploadLimiter = rateLimit(30, 60_000);
+  const previewLimiter = rateLimit(180, 60_000);
 
-  app.use((_request, response, next) => {
+  app.use((request, response, next) => {
+    const requestId = crypto.randomUUID();
+    response.setHeader("X-Request-Id", requestId);
+    const startedAt = performance.now();
+    response.on("finish", () => {
+      if (!request.path.startsWith("/api") || request.path === "/api/health") return;
+      logger.info("http_request", {
+        requestId,
+        method: request.method,
+        path: request.path,
+        status: response.statusCode,
+        durationMs: Math.round(performance.now() - startedAt),
+        ip: request.ip,
+      });
+    });
+
     response.setHeader("X-Content-Type-Options", "nosniff");
     response.setHeader("Referrer-Policy", "same-origin");
     response.setHeader("X-Frame-Options", "DENY");
     response.setHeader("X-Robots-Tag", "noindex, nofollow");
     response.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+    response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+    response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+    response.setHeader(
+      "Content-Security-Policy",
+      [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline'",
+        "img-src 'self' data: blob:",
+        "font-src 'self' data:",
+        "connect-src 'self' ws: wss:",
+        "worker-src 'self' blob:",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+      ].join("; "),
+    );
+    if (process.env.HSTS === "1") {
+      response.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
     next();
   });
   app.use("/api", (_request, response, next) => {
@@ -199,6 +258,10 @@ export function createApp(deps: AppDependencies) {
       maxAge: "1y",
       immutable: true,
       fallthrough: true,
+      setHeaders: (response) => {
+        // Private photos should not sit in a shared proxy cache.
+        response.setHeader("Cache-Control", "private, max-age=31536000, immutable");
+      },
     }),
   );
   if (defaultsDir && existsSync(defaultsDir)) {
@@ -220,6 +283,32 @@ export function createApp(deps: AppDependencies) {
     response.json({ images: DEFAULT_IMAGES });
   });
 
+  app.get(
+    "/api/metrics",
+    asyncRoute(async (request, response) => {
+      const token = process.env.METRICS_TOKEN;
+      if (!token) {
+        sendError(response, 404, "not_found", "That API route does not exist.");
+        return;
+      }
+      if (bearerToken(request.headers.authorization) !== token) {
+        response.setHeader("WWW-Authenticate", "Bearer");
+        sendError(response, 401, "not_authorized", "A metrics token is required.");
+        return;
+      }
+      response.json({
+        uptimeSeconds: Math.round(process.uptime()),
+        rooms: store.stats(),
+        realtime: hub.stats(),
+        storage: {
+          uploadsBytes: await directorySize(uploadsDir),
+          maxTotalBytes: limits.maxTotalBytes,
+          maxRoomBytes: limits.maxRoomBytes,
+        },
+      });
+    }),
+  );
+
   app.post(
     "/api/rooms",
     createLimiter,
@@ -231,7 +320,12 @@ export function createApp(deps: AppDependencies) {
         apiError(400, "bad_name", "Choose a name between 1 and 24 characters.");
       }
       const pieceCount = parsePieceCount(field(request.body, "pieceCount"));
-      const { image, filename } = await resolveImage(request.body, request.file, uploadsDir);
+      const { image, filename } = await resolveImage(
+        request.body,
+        request.file,
+        uploadsDir,
+        limits,
+      );
       const grid = selectGrid(pieceCount, image.width / image.height);
 
       let code = newRoomCode();
@@ -245,8 +339,9 @@ export function createApp(deps: AppDependencies) {
 
       const token = newToken();
       const now = Date.now();
+      let created: { room: StoredRoom; player: StoredPlayer };
       try {
-        const { room, player } = store.createRoom({
+        created = store.createRoom({
           id: newId(),
           code,
           name: roomName,
@@ -265,16 +360,19 @@ export function createApp(deps: AppDependencies) {
           seed: newPuzzleSeed(),
           now,
         });
-        response.status(201).json({ room: roomDto(room, 0), player: playerSession(player, token) });
       } catch (error) {
         if (filename) await removeUpload(filename, uploadsDir);
         throw error;
       }
+      response
+        .status(201)
+        .json({ room: roomDto(created.room, 0), player: playerSession(created.player, token) });
     }),
   );
 
   app.get(
     "/api/rooms/:code/preview",
+    previewLimiter,
     asyncRoute(async (request, response) => {
       const room = getRoomOr404(store, routeParam(request.params.code));
       const host = store.getPlayerById(room.hostPlayerId);
@@ -303,6 +401,9 @@ export function createApp(deps: AppDependencies) {
       if (token) {
         const existing = store.getPlayerByToken(room.id, hashToken(token));
         if (existing) {
+          const now = Date.now();
+          store.touchPlayer(existing.id, now);
+          store.touchRoom(room.id, now);
           const placedCount = store.countPlacements(room.id, room.version);
           response.json({ room: roomDto(room, placedCount), player: playerSession(existing, token) });
           return;
@@ -319,6 +420,7 @@ export function createApp(deps: AppDependencies) {
       if (count >= room.capacity) apiError(409, "room_full", "This room already has its full group.");
 
       const newTokenValue = newToken();
+      const now = Date.now();
       try {
         const player = store.addPlayer({
           id: newId(),
@@ -326,8 +428,9 @@ export function createApp(deps: AppDependencies) {
           name,
           color: PLAYER_COLORS[count % PLAYER_COLORS.length].value,
           tokenHash: hashToken(newTokenValue),
-          now: Date.now(),
+          now,
         });
+        store.touchRoom(room.id, now);
         hub.roomMembershipChanged(room.id);
         const placedCount = store.countPlacements(room.id, room.version);
         response.status(200).json({
@@ -348,17 +451,25 @@ export function createApp(deps: AppDependencies) {
     asyncRoute(async (request, response) => {
       const room = getRoomOr404(store, routeParam(request.params.code));
       const player = getBearerPlayer(store, request, room);
+      // An authenticated puzzle change is activity even if the socket is not open.
+      store.touchPlayer(player.id, Date.now());
       const pieceCount = parsePieceCount(field(request.body, "pieceCount"));
       const { image, filename, newUpload } = await resolveImage(
         request.body,
         request.file,
         uploadsDir,
+        limits,
         room,
       );
       const grid = selectGrid(pieceCount, image.width / image.height);
 
+      let updated: StoredRoom;
       try {
-        const updated = store.updatePuzzle(room.id, {
+        // Image work awaits; the room may have expired or been deleted meanwhile.
+        if (!store.getRoomById(room.id)) {
+          apiError(404, "room_not_found", "That room is no longer available.");
+        }
+        updated = store.updatePuzzle(room.id, {
           image,
           imagePath: filename,
           pieceTarget: pieceCount,
@@ -367,15 +478,15 @@ export function createApp(deps: AppDependencies) {
           seed: newPuzzleSeed(),
           now: Date.now(),
         });
-        if (room.imagePath && room.imagePath !== filename) {
-          await removeUpload(room.imagePath, uploadsDir);
-        }
-        hub.puzzleChanged(room.id);
-        response.json({ room: roomDto(updated, 0), playerId: player.id });
       } catch (error) {
         if (newUpload && filename) await removeUpload(filename, uploadsDir);
         throw error;
       }
+      if (room.imagePath && room.imagePath !== filename) {
+        await removeUpload(room.imagePath, uploadsDir);
+      }
+      hub.puzzleChanged(room.id);
+      response.json({ room: roomDto(updated, 0), playerId: player.id });
     }),
   );
 
@@ -389,6 +500,7 @@ export function createApp(deps: AppDependencies) {
       store.deleteRoom(room.id);
       hub.roomDeleted(room.id);
       if (room.imagePath) await removeUpload(room.imagePath, uploadsDir);
+      logger.info("room_deleted", { roomId: room.id, code: room.code });
       response.status(204).end();
     }),
   );
@@ -440,6 +552,10 @@ export function createApp(deps: AppDependencies) {
       sendError(response, 409, error.code, error.message);
       return;
     }
+    if (error instanceof StorageLimitError) {
+      sendError(response, error.status, error.code, error.message);
+      return;
+    }
     if (error instanceof multer.MulterError) {
       const message =
         error.code === "LIMIT_FILE_SIZE"
@@ -452,7 +568,10 @@ export function createApp(deps: AppDependencies) {
       sendError(response, 400, "bad_json", "That request body was not valid JSON.");
       return;
     }
-    console.error("Unhandled request error:", error);
+    logger.error("unhandled_request_error", {
+      message: (error as Error).message,
+      stack: (error as Error).stack,
+    });
     sendError(response, 500, "internal_error", "Something went wrong on our side.");
   });
 

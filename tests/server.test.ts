@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { crc32, deflateSync } from "node:zlib";
+import sharp from "sharp";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type {
   ApiErrorBody,
@@ -116,6 +117,12 @@ describe("REST rooms", () => {
     const image = await fetch(`${server.baseUrl}${defaults.body.images[0].url}`);
     expect(image.status).toBe(200);
     expect(image.headers.get("content-type")).toContain("image/svg+xml");
+
+    expect(health.headers.get("content-security-policy")).toContain("default-src 'self'");
+    expect(health.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+    expect(health.headers.get("x-frame-options")).toBe("DENY");
+    expect(health.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(health.headers.get("cross-origin-opener-policy")).toBe("same-origin");
   });
 
   it("creates a room, previews it and restores a saved seat", async () => {
@@ -205,6 +212,60 @@ describe("REST rooms", () => {
     expect(missing.body.error.code).toBe("room_not_found");
   });
 
+  it("sends HSTS only when explicitly enabled behind TLS", async () => {
+    const previous = process.env.HSTS;
+    try {
+      process.env.HSTS = "1";
+      const secure = await fetch(`${server.baseUrl}/api/health`);
+      expect(secure.headers.get("strict-transport-security")).toContain("max-age=31536000");
+      delete process.env.HSTS;
+      const plain = await fetch(`${server.baseUrl}/api/health`);
+      expect(plain.headers.get("strict-transport-security")).toBeNull();
+    } finally {
+      if (previous === undefined) delete process.env.HSTS;
+      else process.env.HSTS = previous;
+    }
+  });
+
+  it("exposes operational metrics only with the configured bearer token", async () => {
+    const previous = process.env.METRICS_TOKEN;
+    process.env.METRICS_TOKEN = "test-metrics-token";
+    try {
+      const denied = await requestJson<ApiErrorBody>(server.baseUrl, "/api/metrics");
+      expect(denied.status).toBe(401);
+      expect(denied.body.error.code).toBe("not_authorized");
+
+      const allowed = await requestJson<{
+        rooms: { rooms: number; players: number; placements: number };
+        realtime: { connections: number };
+        storage: { uploadsBytes: number; maxTotalBytes: number };
+      }>(server.baseUrl, "/api/metrics", {
+        headers: auth("test-metrics-token"),
+      });
+      expect(allowed.status).toBe(200);
+      expect(allowed.body.rooms.rooms).toBeGreaterThanOrEqual(0);
+      expect(allowed.body.realtime.connections).toBeGreaterThanOrEqual(0);
+      expect(allowed.body.storage.maxTotalBytes).toBeGreaterThan(0);
+    } finally {
+      if (previous === undefined) delete process.env.METRICS_TOKEN;
+      else process.env.METRICS_TOKEN = previous;
+    }
+  });
+
+  it("rate-limits repeated room previews", async () => {
+    const room = await createTestRoom(server.baseUrl, { pieceCount: 12 });
+    let limited: Response | null = null;
+    for (let index = 0; index < 181; index++) {
+      const response = await fetch(`${server.baseUrl}/api/rooms/${room.code}/preview`);
+      if (response.status === 429) {
+        limited = response;
+        break;
+      }
+    }
+    expect(limited).not.toBeNull();
+    expect(limited?.headers.get("retry-after")).toBeTruthy();
+  });
+
   it("seats four people and refuses a fifth new member", async () => {
     const room = await createTestRoom(server.baseUrl, { pieceCount: 12 });
     const guest = await joinTestRoom(server.baseUrl, room.code, "Theo");
@@ -250,6 +311,7 @@ describe("REST uploads and puzzle changes", () => {
     const served = await fetch(`${server.baseUrl}${room.image.url}`);
     expect(served.status).toBe(200);
     expect(served.headers.get("content-type")).toContain("image/png");
+    expect(served.headers.get("cache-control")).toContain("private");
     expect(served.headers.get("cache-control")).toContain("immutable");
 
     const keep = new FormData();
@@ -305,6 +367,52 @@ describe("REST uploads and puzzle changes", () => {
     });
     expect(removed.status).toBe(204);
     expect(existsSync(join(server.uploadsDir, secondFile))).toBe(false);
+  });
+
+  it("re-encodes uploads to strip camera metadata", async () => {
+    const source = await sharp({
+      create: { width: 320, height: 200, channels: 3, background: { r: 185, g: 95, b: 84 } },
+    })
+      .jpeg()
+      .withMetadata({ exif: { IFD0: { Copyright: "private camera note" } } })
+      .toBuffer();
+    expect((await sharp(source).metadata()).exif).toBeDefined();
+
+    const form = new FormData();
+    form.set("hostName", "Maya");
+    form.set("pieceCount", "12");
+    form.set("imageKind", "upload");
+    form.append("image", new Blob([new Uint8Array(source)], { type: "image/jpeg" }), "photo.jpg");
+    const created = await requestJson<CreatedRoomResponse>(server.baseUrl, "/api/rooms", {
+      method: "POST",
+      body: form,
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.room.image.url).toMatch(/\.jpg$/);
+
+    const stored = await fetch(`${server.baseUrl}${created.body.room.image.url}`);
+    expect(stored.status).toBe(200);
+    expect(stored.headers.get("cache-control")).toContain("private");
+    const metadata = await sharp(Buffer.from(await stored.arrayBuffer())).metadata();
+    expect(metadata.exif).toBeUndefined();
+    expect(metadata.width).toBeLessThanOrEqual(2400);
+    expect(metadata.height).toBeLessThanOrEqual(2400);
+  });
+
+  it("rejects an upload when the storage budget is exhausted", async () => {
+    const limited = await startTestServer({
+      storageLimits: { maxTotalBytes: 64, maxRoomBytes: 64 },
+    });
+    try {
+      const response = await requestJson<ApiErrorBody>(limited.baseUrl, "/api/rooms", {
+        method: "POST",
+        body: uploadForm(makePng(320, 200)),
+      });
+      expect(response.status).toBe(507);
+      expect(response.body.error.code).toBe("storage_limit");
+    } finally {
+      await limited.close();
+    }
   });
 
   it("rejects tiny images, mismatched contents and missing authentication", async () => {
@@ -518,6 +626,31 @@ describe("WebSocket realtime flow", () => {
       (message) => message.players.find((player) => player.id === guest.player.id)?.online === false,
     );
     expect(presence.players.find((player) => player.id === guest.player.id)?.online).toBe(false);
+  });
+
+  it("broadcasts an automatic host transfer without clearing the board", async () => {
+    const room = await createTestRoom(server.baseUrl, { pieceCount: 12 });
+    const guest = await joinTestRoom(server.baseUrl, room.code, "Theo");
+    const hostSocket = await openSocket();
+    const guestSocket = await openSocket();
+    await hostSocket.hello(room.code, room.token);
+    await guestSocket.hello(room.code, guest.player.token);
+
+    const stored = server.store.getRoomByCode(room.code)!;
+    const now = Date.now();
+    const day = 24 * 60 * 60 * 1000;
+    server.store.touchPlayer(room.playerId, now - 30 * day);
+    server.store.touchPlayer(guest.player.id, now);
+    const changed = server.store.reassignInactiveHosts(now - 14 * day, now);
+    expect(changed).toHaveLength(1);
+    server.hub.roomUpdated(stored.id);
+
+    for (const socket of [hostSocket, guestSocket]) {
+      const message = await socket.next("room_updated");
+      expect(message.room.hostPlayerId).toBe(guest.player.id);
+      expect(message.players.find((player) => player.id === guest.player.id)?.isHost).toBe(true);
+      expect(message.room.placedCount).toBe(0);
+    }
   });
 
   it("rejects an invalid token and malformed piece mutations", async () => {

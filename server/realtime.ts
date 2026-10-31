@@ -2,6 +2,7 @@ import type { Server } from "node:http";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import type { DragState, ServerMessage } from "../shared/protocol";
 import { isPointOnBoard, isDropNearSlot, parsePieceId } from "../shared/puzzle";
+import { logger } from "./log";
 import { hashToken, normalizeRoomCode, roomDto } from "./session";
 import { playerDto } from "./session";
 import type { RoomStore, StoredRoom } from "./store";
@@ -59,11 +60,12 @@ export class RealtimeHub {
   private readonly connections = new Map<WebSocket, Connection>();
   private readonly rooms = new Map<string, RoomRuntime>();
   private readonly heartbeat: NodeJS.Timeout;
+  private disposed = false;
 
   constructor(store: RoomStore) {
     this.store = store;
     this.wss.on("connection", (ws) => this.handleConnection(ws));
-    this.heartbeat = setInterval(() => this.heartbeatTick(), 30_000);
+    this.heartbeat = setInterval(() => this.heartbeatTick(), 10_000);
     this.heartbeat.unref?.();
   }
 
@@ -98,6 +100,32 @@ export class RealtimeHub {
     this.announcePlayers(roomId);
   }
 
+  /** Broadcast changed room metadata, for example after an automatic host transfer. */
+  roomUpdated(roomId: string): void {
+    const room = this.store.getRoomById(roomId);
+    if (!room) return;
+    this.broadcast(roomId, {
+      type: "room_updated",
+      room: roomDto(room, this.store.countPlacements(room.id, room.version)),
+      players: this.playersFor(room),
+    });
+  }
+
+  stats(): { connections: number; activeRooms: number; locks: number; drags: number } {
+    let locks = 0;
+    let drags = 0;
+    for (const runtime of this.rooms.values()) {
+      locks += runtime.locks.size;
+      drags += runtime.drags.size;
+    }
+    return {
+      connections: this.connections.size,
+      activeRooms: this.rooms.size,
+      locks,
+      drags,
+    };
+  }
+
   puzzleChanged(roomId: string): void {
     const room = this.store.getRoomById(roomId);
     if (!room) return;
@@ -128,14 +156,18 @@ export class RealtimeHub {
   }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     clearInterval(this.heartbeat);
     for (const ws of this.connections.keys()) {
       try {
-        ws.close(1001, "Server shutting down");
+        ws.terminate();
       } catch {
         // Already closed.
       }
     }
+    this.connections.clear();
+    this.rooms.clear();
     this.wss.close();
   }
 
@@ -160,6 +192,10 @@ export class RealtimeHub {
   }
 
   private handleConnection(ws: WebSocket): void {
+    if (this.disposed) {
+      ws.terminate();
+      return;
+    }
     const connection: Connection = {
       ws,
       socketId: crypto.randomUUID(),
@@ -182,7 +218,17 @@ export class RealtimeHub {
     });
 
     ws.on("message", (data) => {
-      this.handleMessage(connection, data);
+      try {
+        this.handleMessage(connection, data);
+      } catch (error) {
+        logger.error("ws_message_failed", {
+          roomId: connection.roomId,
+          playerId: connection.playerId,
+          message: (error as Error).message,
+        });
+        this.sendError(connection, "server_error", "Something went wrong. Please reconnect.");
+        connection.ws.close(1011, "Internal error");
+      }
     });
 
     ws.on("close", () => {
@@ -288,6 +334,9 @@ export class RealtimeHub {
     }
     connection.roomId = room.id;
     connection.playerId = player.id;
+    const now = Date.now();
+    this.store.touchPlayer(player.id, now);
+    this.store.touchRoom(room.id, now);
 
     const runtime = this.getRuntime(room);
     runtime.sockets.add(connection.ws);
@@ -466,6 +515,13 @@ export class RealtimeHub {
 
   private handleClose(connection: Connection): void {
     this.connections.delete(connection.ws);
+    // dispose() terminates sockets and closes the store immediately afterwards;
+    // close callbacks must not touch the database during shutdown.
+    if (this.disposed) return;
+    logger.info("ws_closed", {
+      roomId: connection.roomId,
+      playerId: connection.playerId,
+    });
     if (!connection.roomId) return;
     const room = this.store.getRoomById(connection.roomId);
     const runtime = this.rooms.get(connection.roomId);
@@ -563,7 +619,11 @@ export class RealtimeHub {
 
   private send(connection: Connection, message: ServerMessage): void {
     if (connection.ws.readyState !== WebSocket.OPEN) return;
-    connection.ws.send(JSON.stringify(message));
+    try {
+      connection.ws.send(JSON.stringify(message));
+    } catch {
+      connection.ws.terminate();
+    }
   }
 
   private sendError(connection: Connection, code: string, message: string, pieceId?: string): void {
@@ -576,15 +636,32 @@ export class RealtimeHub {
     const payload = JSON.stringify(message);
     for (const ws of runtime.sockets) {
       if (ws === except) continue;
-      if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      try {
+        ws.send(payload);
+      } catch {
+        ws.terminate();
+      }
     }
   }
 
   private heartbeatTick(): void {
+    const now = Date.now();
     for (const connection of this.connections.values()) {
       if (!connection.isAlive) {
         connection.ws.terminate();
         continue;
+      }
+      // Keep a live host from being treated as inactive by host recovery.
+      if (connection.playerId) {
+        try {
+          this.store.touchPlayer(connection.playerId, now);
+        } catch (error) {
+          logger.warn("heartbeat_touch_failed", {
+            playerId: connection.playerId,
+            message: (error as Error).message,
+          });
+        }
       }
       connection.isAlive = false;
       try {

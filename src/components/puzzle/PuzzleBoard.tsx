@@ -1,4 +1,18 @@
-import type { MouseEvent, PointerEvent, ReactNode, RefObject } from "react";
+import {
+  Image as ImageIcon,
+  Maximize2,
+  Minus,
+  Plus,
+} from "lucide-react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+  type PointerEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import type { PlayerDto, RoomDto } from "../../../shared/protocol";
 import type { DragState } from "../../../shared/protocol";
 import {
@@ -27,6 +41,13 @@ interface PuzzleBoardProps {
   overlay?: ReactNode;
   onPlaceSelected?: (point: { x: number; y: number }) => void;
   onCursorMove?: (point: { x: number; y: number }) => void;
+}
+
+const MIN_ZOOM = 1;
+const MAX_ZOOM = 3;
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function piecePositionStyle(piece: PuzzlePiece, rows: number, cols: number) {
@@ -66,8 +87,77 @@ export function PuzzleBoard({
   onCursorMove,
 }: PuzzleBoardProps) {
   const aspect = room.image.width / room.image.height;
-  const { ref, size } = useFitBox(aspect);
+  const { ref: fitRef, size } = useFitBox(aspect);
   const playerMap = new Map(players.map((player) => [player.id, player]));
+
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [referenceVisible, setReferenceVisible] = useState(false);
+  const boardElement = useRef<HTMLDivElement | null>(null);
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  const panGesture = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    panX: number;
+    panY: number;
+  } | null>(null);
+  const pinchGesture = useRef<{ distance: number; zoom: number } | null>(null);
+
+  function clampPan(next: { x: number; y: number }, nextZoom = zoom) {
+    const wrapper = fitRef.current;
+    if (!wrapper) return next;
+    const bounds = wrapper.getBoundingClientRect();
+    const maxX = Math.max(0, (size.width * nextZoom - bounds.width) / 2);
+    const maxY = Math.max(0, (size.height * nextZoom - bounds.height) / 2);
+    return {
+      x: clamp(next.x, -maxX, maxX),
+      y: clamp(next.y, -maxY, maxY),
+    };
+  }
+
+  function setZoomLevel(nextZoom: number) {
+    const clamped = clamp(nextZoom, MIN_ZOOM, MAX_ZOOM);
+    setZoom(clamped);
+    setPan((current) => (clamped === 1 ? { x: 0, y: 0 } : clampPan(current, clamped)));
+  }
+
+  function resetView() {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }
+
+  const wheelState = useRef({ zoom, clampPan });
+  wheelState.current = { zoom, clampPan };
+
+  useEffect(() => {
+    const element = boardElement.current;
+    if (!element) return;
+    // React attaches wheel listeners passively, so preventDefault there is
+    // ignored. Use a native non-passive listener to keep the page still.
+    const onWheel = (event: WheelEvent) => {
+      if (event.deltaY === 0) return;
+      event.preventDefault();
+      const current = wheelState.current;
+      const next = clamp(
+        current.zoom * (event.deltaY < 0 ? 1.12 : 1 / 1.12),
+        MIN_ZOOM,
+        MAX_ZOOM,
+      );
+      setZoom(next);
+      setPan((value) => (next === 1 ? { x: 0, y: 0 } : current.clampPan(value, next)));
+    };
+    element.addEventListener("wheel", onWheel, { passive: false });
+    return () => element.removeEventListener("wheel", onWheel);
+  }, []);
+
+  useEffect(() => {
+    resetView();
+    setReferenceVisible(false);
+    pointers.current.clear();
+    panGesture.current = null;
+    pinchGesture.current = null;
+  }, [room.version, puzzle.rows, puzzle.cols]);
 
   function boardPoint(event: PointerEvent<HTMLDivElement> | MouseEvent<HTMLDivElement>) {
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -78,12 +168,25 @@ export function PuzzleBoard({
     return { x, y };
   }
 
+  function pointerDistance() {
+    const values = [...pointers.current.values()];
+    if (values.length < 2) return null;
+    return Math.hypot(values[0].x - values[1].x, values[0].y - values[1].y);
+  }
+
   const visible = size.width > 0;
 
   return (
-    <div ref={ref} className="grid min-h-0 w-full flex-1 place-items-center">
+    <div
+      ref={fitRef}
+      className={cn(
+        "relative grid min-h-0 w-full flex-1 place-items-center",
+        zoom > 1 && "overflow-hidden",
+      )}
+    >
       <div
         ref={(element) => {
+          boardElement.current = element;
           if (boardRef) boardRef.current = element;
         }}
         data-testid="puzzle-board"
@@ -91,7 +194,7 @@ export function PuzzleBoard({
         data-rows={puzzle.rows}
         data-cols={puzzle.cols}
         className={cn(
-          "relative select-none overflow-hidden rounded-[14px] border border-white/70 bg-[#e8ddcd] shadow-[0_26px_65px_-32px_rgba(57,37,33,0.55),inset_0_0_0_1px_rgba(84,59,50,0.06)] transition-opacity duration-200",
+          "relative select-none touch-none overflow-hidden rounded-[14px] border border-white/70 bg-[#e8ddcd] shadow-[0_26px_65px_-32px_rgba(57,37,33,0.55),inset_0_0_0_1px_rgba(84,59,50,0.06)] transition-opacity duration-200",
           "outline-none focus-visible:ring-2 focus-visible:ring-rosewood focus-visible:ring-offset-2 focus-visible:ring-offset-parchment",
           selectedPiece && "cursor-crosshair",
           !visible && "opacity-0",
@@ -100,6 +203,9 @@ export function PuzzleBoard({
           width: visible ? size.width : undefined,
           height: visible ? size.height : undefined,
           aspectRatio: visible ? undefined : aspect,
+          transform: `translate3d(${pan.x}px, ${pan.y}px, 0) scale(${zoom})`,
+          transformOrigin: "center",
+          willChange: zoom > 1 ? "transform" : undefined,
         }}
         role="group"
         tabIndex={selectedPiece ? 0 : -1}
@@ -120,10 +226,74 @@ export function PuzzleBoard({
           const point = boardPoint(event);
           if (point) onPlaceSelected(point);
         }}
+        onDoubleClick={() => resetView()}
+        onPointerDown={(event) => {
+          if (event.pointerType === "mouse" && event.button !== 0) return;
+          try {
+            event.currentTarget.setPointerCapture(event.pointerId);
+          } catch {
+            // Synthetic events and some browsers refuse capture.
+          }
+          pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+          const distance = pointerDistance();
+          if (distance !== null) {
+            pinchGesture.current = { distance, zoom };
+            panGesture.current = null;
+          } else if (!selectedPiece && zoom > 1) {
+            panGesture.current = {
+              pointerId: event.pointerId,
+              startX: event.clientX,
+              startY: event.clientY,
+              panX: pan.x,
+              panY: pan.y,
+            };
+          }
+        }}
         onPointerMove={(event) => {
-          if (!onCursorMove) return;
           const point = boardPoint(event);
-          if (point) onCursorMove(point);
+          if (point && onCursorMove) onCursorMove(point);
+
+          if (!pointers.current.has(event.pointerId)) return;
+          pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+
+          if (pinchGesture.current && pointers.current.size >= 2) {
+            const distance = pointerDistance();
+            if (distance && pinchGesture.current.distance > 0) {
+              const next = clamp(
+                pinchGesture.current.zoom * (distance / pinchGesture.current.distance),
+                MIN_ZOOM,
+                MAX_ZOOM,
+              );
+              setZoom(next);
+              setPan((current) => clampPan(current, next));
+            }
+            return;
+          }
+
+          const gesture = panGesture.current;
+          if (gesture?.pointerId === event.pointerId) {
+            setPan(
+              clampPan({
+                x: gesture.panX + event.clientX - gesture.startX,
+                y: gesture.panY + event.clientY - gesture.startY,
+              }),
+            );
+          }
+        }}
+        onPointerUp={(event) => {
+          pointers.current.delete(event.pointerId);
+          if (pointers.current.size < 2) pinchGesture.current = null;
+          if (panGesture.current?.pointerId === event.pointerId) panGesture.current = null;
+          try {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          } catch {
+            // Capture may already be gone.
+          }
+        }}
+        onPointerCancel={(event) => {
+          pointers.current.delete(event.pointerId);
+          if (pointers.current.size < 2) pinchGesture.current = null;
+          if (panGesture.current?.pointerId === event.pointerId) panGesture.current = null;
         }}
       >
         <img
@@ -236,6 +406,76 @@ export function PuzzleBoard({
 
         {overlay}
       </div>
+
+      <div
+        className="absolute right-2 top-2 z-40 flex items-center gap-0.5 rounded-full border border-white/75 bg-parchment/92 p-1 shadow-[0_8px_24px_-12px_rgba(57,37,33,0.45)] backdrop-blur-sm"
+        role="group"
+        aria-label="Board view controls"
+      >
+        <button
+          type="button"
+          onClick={() => setZoomLevel(zoom / 1.25)}
+          disabled={zoom <= MIN_ZOOM}
+          className="grid h-7 w-7 place-items-center rounded-full text-cocoa-soft outline-none transition hover:bg-cocoa/[0.06] hover:text-cocoa focus-visible:ring-2 focus-visible:ring-rosewood disabled:opacity-35"
+          aria-label="Zoom out"
+          title="Zoom out"
+        >
+          <Minus className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+        <span className="min-w-9 text-center text-[0.62rem] font-semibold tabular-nums text-cocoa-soft">
+          {Math.round(zoom * 100)}%
+        </span>
+        <button
+          type="button"
+          onClick={() => setZoomLevel(zoom * 1.25)}
+          disabled={zoom >= MAX_ZOOM}
+          className="grid h-7 w-7 place-items-center rounded-full text-cocoa-soft outline-none transition hover:bg-cocoa/[0.06] hover:text-cocoa focus-visible:ring-2 focus-visible:ring-rosewood disabled:opacity-35"
+          aria-label="Zoom in"
+          title="Zoom in"
+        >
+          <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          onClick={resetView}
+          disabled={zoom === MIN_ZOOM && pan.x === 0 && pan.y === 0}
+          className="grid h-7 w-7 place-items-center rounded-full text-cocoa-soft outline-none transition hover:bg-cocoa/[0.06] hover:text-cocoa focus-visible:ring-2 focus-visible:ring-rosewood disabled:opacity-35"
+          aria-label="Reset board view"
+          title="Reset board view"
+        >
+          <Maximize2 className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+        <span className="mx-0.5 h-4 w-px bg-cocoa/10" aria-hidden="true" />
+        <button
+          type="button"
+          onClick={() => setReferenceVisible((current) => !current)}
+          aria-pressed={referenceVisible}
+          className={cn(
+            "grid h-7 w-7 place-items-center rounded-full outline-none transition hover:bg-cocoa/[0.06] focus-visible:ring-2 focus-visible:ring-rosewood",
+            referenceVisible ? "bg-blush/70 text-rosewood" : "text-cocoa-soft hover:text-cocoa",
+          )}
+          aria-label={referenceVisible ? "Hide reference picture" : "Show reference picture"}
+          title={referenceVisible ? "Hide reference picture" : "Show reference picture"}
+        >
+          <ImageIcon className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+      </div>
+
+      {referenceVisible && (
+        <div
+          data-testid="reference-image"
+          className="pointer-events-none absolute bottom-2 left-2 z-40 w-28 overflow-hidden rounded-xl border border-white/80 bg-parchment/90 p-1 shadow-[0_12px_30px_-15px_rgba(57,37,33,0.55)] sm:w-36"
+        >
+          <img
+            src={room.image.url}
+            alt={room.image.title ?? "Puzzle reference"}
+            className="h-auto w-full rounded-lg object-cover"
+          />
+          <p className="px-1 pb-0.5 pt-1 text-center text-[0.55rem] font-semibold uppercase tracking-[0.14em] text-cocoa-soft">
+            Reference
+          </p>
+        </div>
+      )}
     </div>
   );
 }

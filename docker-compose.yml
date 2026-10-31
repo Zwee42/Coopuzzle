@@ -15,6 +15,15 @@ services:
       DATA_DIR: /app/data
       # Set to 1 only behind a trusted reverse proxy that sets X-Forwarded-For.
       TRUST_PROXY: "${TRUST_PROXY:-0}"
+      ROOM_TTL_DAYS: "${ROOM_TTL_DAYS:-30}"
+      HOST_TRANSFER_DAYS: "${HOST_TRANSFER_DAYS:-14}"
+      MAINTENANCE_INTERVAL_MINUTES: "${MAINTENANCE_INTERVAL_MINUTES:-60}"
+      ORPHAN_UPLOAD_GRACE_HOURS: "${ORPHAN_UPLOAD_GRACE_HOURS:-24}"
+      MAX_TOTAL_UPLOAD_MB: "${MAX_TOTAL_UPLOAD_MB:-2048}"
+      MAX_ROOM_UPLOAD_MB: "${MAX_ROOM_UPLOAD_MB:-24}"
+      METRICS_TOKEN: "${METRICS_TOKEN:-}"
+      HSTS: "${HSTS:-0}"
+      LOG_LEVEL: "${LOG_LEVEL:-}"
     volumes:
       - puzzle-data:/app/data
     restart: unless-stopped

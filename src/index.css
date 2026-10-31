@@ -202,6 +202,17 @@
   }
 }
 
+.tray-piece {
+  content-visibility: auto;
+  contain-intrinsic-size: 78px 78px;
+}
+
+@media (min-width: 1024px) {
+  .tray-piece {
+    contain-intrinsic-size: 108px 84px;
+  }
+}
+
 .tray-scroll {
   scrollbar-width: thin;
   scrollbar-color: rgba(126, 104, 96, 0.28) transparent;

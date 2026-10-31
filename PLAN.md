@@ -5,8 +5,9 @@
 Build a private, persistent jigsaw room where a small group (2–4 people) can work on the
 same puzzle together, in real time, with no account required. One person creates a room,
 picks a bundled image or uploads a photo, and chooses a piece count. The room lives at an
-invite link until its host deletes it. Every drag, grab, placement, cursor and presence
-change is broadcast over a single WebSocket connection and reconciled server-side.
+invite link until its host deletes it or it expires after a period of inactivity. Every drag,
+grab, placement, cursor and presence change is broadcast over a single WebSocket connection
+and reconciled server-side.
 
 ## Design decisions
 
@@ -18,15 +19,15 @@ change is broadcast over a single WebSocket connection and reconciled server-sid
 | Rooms | 7-character unlisted code. Private rooms, no gallery. Guests choose a display name. Tokens live in `localStorage` per room. |
 | Members | Up to **4** members per room; a fifth new member is rejected. Returning members with a valid token can rejoin. |
 | Persistence | SQLite via Node's built-in `node:sqlite`, plus uploads in `data/uploads`. No in-memory-only rooms. |
-| Identity | No accounts. Each member gets a random session token stored hashed in SQLite. Host is the member who created the room. |
-| Images | 4 original bundled SVG illustrations, plus JPEG/PNG/WebP uploads (client resized to max 2400 px, server validated). Default images require no upload. |
+| Identity | No accounts. Each member gets a random session token stored hashed in SQLite. The creator starts as host; an inactive host can be replaced automatically. |
+| Images | 4 original bundled SVG illustrations, plus JPEG/PNG/WebP uploads (client resized to max 2400 px; server validated, auto-oriented, downscaled and re-encoded with `sharp`, stripping EXIF/GPS). Default images require no upload. |
 | Puzzle | Classic interlocking tabs, no rotation. Pieces are generated deterministically from a seed. Puzzle presets: **12, 24, 48, 80, 120, 200, 300** pieces; exact count shown. |
-| Board | Loose pieces live in a tray (right on desktop, below on mobile). Drag onto the board; a piece within 0.9 cell of its home slot snaps and locks. |
+| Board | Loose pieces live in a tray (right on desktop, below on mobile) with All/Edges/Corners filters. Drag onto the board; a piece within 0.9 cell of its home slot snaps and locks. The board supports 1–3× zoom, pan, a floating reference picture and a full preview. |
 | Turn flow | No timer, no score. Both members can restart/change the puzzle. The initiator confirms; the server broadcasts the new puzzle to everyone. |
-| Rooms lifecycle | Persist until the host deletes the room. Deleting removes the room, members, placements and any uploaded image file. |
+| Rooms lifecycle | Persist until the host deletes the room or it is inactive for 30 days (configurable). Deleting removes the room, members, placements and any uploaded image file. A host absent for 14 days is replaced by the most recently active member. |
 | Presence | Shared cursors while over the board, online dots, live drag ghosts, piece locks. Cursors expire after ~4 s of inactivity. |
 | Art | Cozy romantic: cream paper, warm terracotta/rose, sage, plum ink, Fraunces display type, soft grain and restrained motion. Responsive phone/tablet/desktop. |
-| Deployment | Single Node process serving the built SPA, REST and WebSocket. Dockerfile + compose volume. One instance only (realtime locks are process-local; persisted state is in SQLite). |
+| Deployment | Single Node process serving the built SPA, REST and WebSocket. Dockerfile + compose volume. One instance only (realtime locks, rate-limit buckets and maintenance are process-local; persisted state is in SQLite). |
 | Errors | Room-not-found, room-full, invalid upload, reconnect, partner disconnect, and "piece already held" states are explicit; no silent failures. |
 
 ## Rules
@@ -43,7 +44,9 @@ change is broadcast over a single WebSocket connection and reconciled server-sid
 | Disconnect while holding pieces | Release that socket's locks immediately. |
 | Restart puzzle | Any member, after client-side confirmation. New version + seed, clear placements and locks, broadcast. Old uploaded image is deleted. |
 | Delete room | Host only. Remove database rows, uploaded file, sockets and clients. |
-| Reconnect | Retry with backoff and the same token; receive current snapshot. No duplicate version or stale placement can be applied. |
+| Inactive host | After `HOST_TRANSFER_DAYS`, promote the most recently active member. Board, placements and locks are untouched. |
+| Inactive room | After `ROOM_TTL_DAYS`, delete the room, players, placements and upload; notify connected clients. |
+| Reconnect | Retry with backoff and the same token; reconnect immediately on network return or a visible tab; receive current snapshot. No duplicate version or stale placement can be applied. |
 
 ## Implementation notes
 
@@ -58,14 +61,21 @@ change is broadcast over a single WebSocket connection and reconciled server-sid
   The tray order is a seeded permutation, then filtered by placed state.
 - **Versioning:** every puzzle has a room version. Placement/restart operations carry the version
   so a late drop from the previous puzzle is rejected.
-- **Upload safety:** MIME allowlist, 12 MB request cap, `image-size` parse, UUID filename, no
-  user-controlled paths. Uploads are served unlisted with long cache lifetimes. The client
-  downscales before upload.
+- **Upload safety:** MIME allowlist, 12 MB request cap, `sharp` format/dimension/pixel checks,
+  auto-orient, 2400 px output cap, metadata stripping, UUID filename, no user-controlled paths.
+  Uploads are served unlisted with private long-lived cache headers. The client downscales before
+  upload. Global and per-room byte budgets are checked under a serialized upload lock; orphaned
+  files are pruned after a grace period.
 - **Tokens:** 32-byte random tokens, SHA-256 at rest. Never log tokens.
 - **WebSocket validation:** max payload 32 KB; validate room membership, puzzle version, piece
   IDs and coordinate ranges for every mutation. Heartbeats reap dead clients.
 - **Reconnect UX:** connection state is visible. In-flight local drags reset on disconnect;
-  server state wins after snapshot.
+  server state wins after snapshot. A 10-second heartbeat reaps dead sockets, and the browser
+  reconnects immediately when the network returns or the tab becomes visible.
+- **Operations:** a maintenance loop handles retention, host recovery and orphan cleanup. An
+  offline admin CLI lists/deletes/prunes rooms. `scripts/backup.mjs` snapshots SQLite plus uploads
+  and verifies the pair; restore replaces uploads and removes stale WAL/SHM files. Structured JSON
+  logs and optional token-protected metrics support a single-instance deployment.
 - **Accessibility:** piece cards are buttons and keyboard-selectable; selected piece can be
   placed by clicking/tapping the board. Dialogs use native `<dialog>`, focus returns to the
   trigger. Reduced-motion removes celebratory and snap animations.
@@ -88,14 +98,20 @@ change is broadcast over a single WebSocket connection and reconciled server-sid
 - [x] The host can delete the room; the other browser is redirected out of the room immediately.
 - [x] Completion is shown only after every piece is placed, with a celebration and a next-puzzle action.
 - [x] Layout has no horizontal overflow at 390 px, 768 px, 1024 px and 1440 px widths.
-- [x] `npm test` passes core and server/WebSocket tests; `npm run e2e` passes the two-browser flow.
+- [x] Board zoom/pan, reference picture and tray filters work without scrolling the page.
+- [x] Invite dialog shows a QR code for the room link.
+- [x] A restarted server reconnects clients without a phantom placement while a piece is held.
+- [x] Expired rooms and orphaned uploads are pruned; a quiet host is replaced without clearing the board.
+- [x] Backups restore SQLite and uploads together; admin commands cover list/delete/prune/stats.
+- [x] `npm test` passes core, store, storage, backup and server/WebSocket tests; `npm run e2e` passes the multi-browser flow.
 - [x] `getownit` is installed and configured as far as this environment allows; manual login/remote steps are documented.
 
 ## Out of scope for this version
 
 - Accounts, email, password reset, public profiles.
 - Public room discovery, likes, comments, chat, leaderboards, timers or scoring.
-- Piece rotation, zoom/pan, image cropping before upload, GIF/video uploads.
+- Piece rotation, image cropping before upload, GIF/video uploads.
 - Moderation/reporting; rooms are invite-only and images are unlisted.
 - Horizontal scaling (multiple Node instances), S3/CDN, S3-compatible object storage.
+- End-to-end encryption or encryption at rest; uploaded images are unlisted but URL-accessible.
 - Native apps, offline play, push notifications.

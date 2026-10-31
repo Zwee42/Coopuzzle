@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { PieceTarget } from "../shared/difficulty";
 import { RoomFullError, RoomStore, type StoredRoom } from "../server/store";
@@ -8,6 +9,7 @@ import { hashToken, newId, newPuzzleSeed, newToken } from "../server/session";
 
 let dataDir: string;
 let store: RoomStore;
+const day = 24 * 60 * 60 * 1000;
 
 beforeEach(() => {
   dataDir = mkdtempSync(join(tmpdir(), "puzzle-together-store-"));
@@ -174,6 +176,78 @@ describe("RoomStore placements", () => {
   });
 });
 
+describe("RoomStore lifecycle", () => {
+  it("promotes the most recently active member when the host goes quiet", () => {
+    const { room, hostId } = createRoom();
+    const guestId = newId();
+    const guestToken = newToken();
+    const now = Date.now();
+    store.addPlayer({
+      id: guestId,
+      roomId: room.id,
+      name: "Theo",
+      color: "#63816d",
+      tokenHash: hashToken(guestToken),
+      now,
+    });
+
+    store.touchPlayer(hostId, now - 30 * day);
+    store.touchPlayer(guestId, now);
+    const changed = store.reassignInactiveHosts(now - 14 * day, now);
+
+    expect(changed).toHaveLength(1);
+    expect(changed[0].hostPlayerId).toBe(guestId);
+    expect(store.getPlayerById(guestId)?.isHost).toBe(true);
+    expect(store.getPlayerById(hostId)?.isHost).toBe(false);
+  });
+
+  it("does not hand a room to a member who has also gone quiet", () => {
+    const { room, hostId } = createRoom();
+    const guestId = newId();
+    const now = Date.now();
+    store.addPlayer({
+      id: guestId,
+      roomId: room.id,
+      name: "Theo",
+      color: "#63816d",
+      tokenHash: hashToken(newToken()),
+      now: now - 30 * day,
+    });
+    store.touchPlayer(hostId, now - 30 * day);
+    store.touchPlayer(guestId, now - 30 * day);
+
+    expect(store.reassignInactiveHosts(now - 14 * day, now)).toEqual([]);
+    expect(store.getPlayerById(hostId)?.isHost).toBe(true);
+  });
+
+  it("migrates old players from room activity instead of immediately expiring the host", () => {
+    const { room, hostId } = createRoom();
+    const roomActivity = room.updatedAt + 5_000;
+    store.touchRoom(room.id, roomActivity);
+    store.close();
+
+    const legacy = new DatabaseSync(join(dataDir, "puzzle-together.db"));
+    legacy.exec("ALTER TABLE players DROP COLUMN last_seen_at");
+    legacy.close();
+
+    store = new RoomStore(dataDir);
+    expect(store.getPlayerById(hostId)?.lastSeenAt).toBe(roomActivity);
+  });
+
+  it("deletes rooms whose last activity is past the retention cutoff", () => {
+    const { room, hostId } = createRoom();
+    store.placePiece(room.id, room.version, "r0c0", hostId, Date.now());
+    const now = Date.now();
+    store.touchRoom(room.id, now - 40 * day);
+
+    const expired = store.deleteExpiredRooms(now - 30 * day);
+    expect(expired.map((entry) => entry.id)).toEqual([room.id]);
+    expect(store.getRoomById(room.id)).toBeNull();
+    expect(store.getPlayerById(hostId)).toBeNull();
+    expect(store.countPlacements(room.id, room.version)).toBe(0);
+  });
+});
+
 describe("RoomStore persistence", () => {
   it("survives a close and reopen with placements intact", () => {
     const { room, hostId } = createRoom({ seed: 555 });
@@ -182,7 +256,8 @@ describe("RoomStore persistence", () => {
 
     store = new RoomStore(dataDir);
     const reopened = store.getRoomByCode(room.code);
-    expect(reopened).toEqual(room);
+    // Placing a piece is activity, so it refreshes the room's retention timestamp.
+    expect(reopened).toEqual({ ...room, updatedAt: 123 });
     expect(store.getPlacements(room.id, room.version)).toEqual([
       { pieceId: "r0c0", placedBy: hostId, placedAt: 123 },
     ]);

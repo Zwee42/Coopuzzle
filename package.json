@@ -9,14 +9,18 @@
     "dev:web": "vite --host 0.0.0.0",
     "build": "npm run build:web && npm run build:server",
     "build:web": "vite build",
-    "build:server": "esbuild server/index.ts --bundle --platform=node --format=esm --outfile=dist-server/index.js --packages=external --sourcemap",
+    "build:server": "esbuild server/index.ts --bundle --platform=node --format=esm --outfile=dist-server/index.js --packages=external --sourcemap && esbuild server/admin.ts --bundle --platform=node --format=esm --outfile=dist-server/admin.js --packages=external --sourcemap",
     "start": "node dist-server/index.js",
     "preview": "npm run build && npm start",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "e2e": "npm run build && node scripts/e2e.mjs",
-    "ownit": "ownit"
+    "ownit": "ownit",
+    "admin": "node dist-server/admin.js",
+    "admin:dev": "tsx server/admin.ts",
+    "backup": "node scripts/backup.mjs",
+    "restore": "node scripts/restore.mjs"
   },
   "keywords": [
     "jigsaw",
@@ -33,13 +37,13 @@
     "@fontsource-variable/dm-sans": "^5.3.0",
     "@fontsource-variable/fraunces": "^5.3.0",
     "express": "^5.3.0",
-    "image-size": "^2.0.4",
     "lucide-react": "^1.61.0",
     "multer": "^2.5.0",
-    "ownit": "^0.0.4",
+    "qrcode.react": "^4.2.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "react-router-dom": "^7.18.4",
+    "sharp": "^0.35.5",
     "ws": "^8.22.0"
   },
   "devDependencies": {

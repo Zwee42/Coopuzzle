@@ -1,11 +1,12 @@
 /**
- * Two-browser end-to-end test for Puzzle Together.
+ * Multi-browser end-to-end test for Puzzle Together.
  *
  * It builds nothing: run `npm run build` first (the `npm run e2e` script does it
  * for you), then this script starts a throwaway server with its own SQLite data
- * directory and drives two isolated Chromium contexts through the full flow:
+ * directory and drives isolated Chromium contexts through the full flow:
  *
- *   create → invite → join → presence → drag → tap → refresh → restart → delete
+ *   create → invite → four seats → QR → zoom/filter → connection drop →
+ *   drag → tap → refresh → restart → delete
  *
  * Set CHROMIUM_PATH to override the browser executable.
  */
@@ -56,6 +57,32 @@ async function waitForHealth(baseUrl) {
   throw new Error(`Server did not become healthy at ${baseUrl}`);
 }
 
+function launchServer(port, dataDir) {
+  const child = spawn(process.execPath, ["dist-server/index.js"], {
+    cwd: root,
+    env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", DATA_DIR: dataDir },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  child.stdout.on("data", (chunk) => serverOutput.push(String(chunk)));
+  child.stderr.on("data", (chunk) => serverOutput.push(String(chunk)));
+  return child;
+}
+
+async function stopServer(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  await new Promise((resolveStop) => {
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolveStop();
+    }, 4_000);
+    child.once("exit", () => {
+      clearTimeout(timer);
+      resolveStop();
+    });
+  });
+}
+
 async function waitForHeaderProgress(page, progress, timeout = 12_000) {
   await page.waitForFunction(
     (expected) => document.querySelector("header")?.textContent?.includes(expected) ?? false,
@@ -72,12 +99,24 @@ async function waitForHere(page, count, timeout = 12_000) {
   );
 }
 
+async function joinAs(page, base, code, name) {
+  await page.goto(`${base}/join/${code}`, { waitUntil: "networkidle" });
+  await page.locator("#join-name").waitFor({ state: "visible" });
+  await page.locator("#join-name").fill(name);
+  await page.getByRole("button", { name: "Take my seat" }).click();
+  await page.waitForURL(new RegExp(`/room/${code}$`), { timeout: 15_000 });
+  await page.waitForSelector('[data-testid="puzzle-board"]');
+}
+
 function trackPage(page, label) {
   page.on("pageerror", (error) => {
     consoleErrors.push(`[${label}] page error: ${error.message}`);
   });
   page.on("console", (message) => {
-    if (message.type() === "error") consoleErrors.push(`[${label}] console: ${message.text()}`);
+    if (message.type() !== "error") return;
+    // The deliberate server restart in the reconnect test produces these.
+    if (/WebSocket connection|ERR_INTERNET_DISCONNECTED|net::ERR/i.test(message.text())) return;
+    consoleErrors.push(`[${label}] console: ${message.text()}`);
   });
 }
 
@@ -172,13 +211,7 @@ async function main() {
   const dataDir = await mkdtemp(join(tmpdir(), "puzzle-together-e2e-"));
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
-  const server = spawn(process.execPath, ["dist-server/index.js"], {
-    cwd: root,
-    env: { ...process.env, PORT: String(port), HOST: "127.0.0.1", DATA_DIR: dataDir },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  server.stdout.on("data", (chunk) => serverOutput.push(String(chunk)));
-  server.stderr.on("data", (chunk) => serverOutput.push(String(chunk)));
+  let server = launchServer(port, dataDir);
 
   let browser;
   let hostContext;
@@ -226,6 +259,163 @@ async function main() {
     await waitForHere(guest, 2);
     log("guest joined and both browsers see two people present");
 
+    // --- Two tabs, same saved session ------------------------------------
+    const hostSecond = await hostContext.newPage();
+    trackPage(hostSecond, "host-second-tab");
+    await hostSecond.goto(`${base}/room/${code}`, { waitUntil: "networkidle" });
+    await hostSecond.waitForSelector('[data-testid="puzzle-board"]');
+    await waitForHeaderProgress(hostSecond, "0/24 pieces");
+    await waitForHere(hostSecond, 2);
+    await hostSecond.getByText("Sunday together").waitFor({ state: "visible" });
+    await hostSecond.close();
+    log("a second tab restored the same host session without taking another seat");
+
+    // --- Four seats, fifth rejected --------------------------------------
+    const guest2Context = await browser.newContext({ viewport: { width: 1440, height: 950 } });
+    const guest3Context = await browser.newContext({ viewport: { width: 1440, height: 950 } });
+    const guest2 = await guest2Context.newPage();
+    const guest3 = await guest3Context.newPage();
+    trackPage(guest2, "guest-2");
+    trackPage(guest3, "guest-3");
+    await joinAs(guest2, base, code, "June");
+    await joinAs(guest3, base, code, "Kai");
+    await waitForHere(host, 4);
+    await waitForHere(guest, 4);
+
+    const fifthContext = await browser.newContext({ viewport: { width: 1440, height: 950 } });
+    const fifth = await fifthContext.newPage();
+    trackPage(fifth, "fifth");
+    await fifth.goto(`${base}/join/${code}`, { waitUntil: "networkidle" });
+    await fifth.getByText("This room is full.").waitFor({ state: "visible" });
+    assert(await fifth.locator("#join-name").isDisabled(), "Full-room form should be disabled");
+    const fifthResponse = await fetch(`${base}/api/rooms/${code}/join`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Nope" }),
+    });
+    assert(fifthResponse.status === 409, "The API should reject a fifth player");
+    assert(
+      (await fifthResponse.json()).error.code === "room_full",
+      "A fifth player should receive room_full",
+    );
+    await fifth.close();
+    await fifthContext.close();
+    log("all four seats filled and a fifth player was turned away");
+
+    // --- QR invite --------------------------------------------------------
+    await host.getByRole("button", { name: "Invite someone" }).click();
+    const inviteDialog = host.locator("dialog[open]");
+    await inviteDialog.waitFor({ state: "visible" });
+    await inviteDialog.locator('[data-testid="invite-qr"]').waitFor({ state: "visible" });
+    assert(
+      (await inviteDialog.locator('[data-testid="invite-qr"] svg').count()) === 1,
+      "Invite dialog should render a QR code",
+    );
+    await inviteDialog.getByRole("button", { name: "Done" }).click();
+    log("invite dialog rendered a scannable QR code");
+
+    // --- Zoom, pan, reference and tray filters ----------------------------
+    const board = host.locator('[data-testid="puzzle-board"]');
+    const baseBoardBox = await board.boundingBox();
+    assert(baseBoardBox, "Board should have a measurable box");
+    const scrollBeforeWheel = await host.evaluate(() => window.scrollY);
+    await host.mouse.move(
+      baseBoardBox.x + baseBoardBox.width / 2,
+      baseBoardBox.y + baseBoardBox.height / 2,
+    );
+    await host.mouse.wheel(0, -120);
+    await host.waitForTimeout(140);
+    const wheelBoardBox = await board.boundingBox();
+    assert(
+      wheelBoardBox && wheelBoardBox.width > baseBoardBox.width * 1.05,
+      "Mouse wheel should zoom the board",
+    );
+    assert(
+      (await host.evaluate(() => window.scrollY)) === scrollBeforeWheel,
+      "Mouse wheel zoom must not scroll the page",
+    );
+    await host.getByRole("button", { name: "Reset board view" }).click();
+    await host.waitForTimeout(120);
+    await host.getByRole("button", { name: "Zoom in" }).click();
+    await host.waitForTimeout(140);
+    const zoomedBoardBox = await board.boundingBox();
+    assert(
+      zoomedBoardBox && zoomedBoardBox.width > baseBoardBox.width * 1.1,
+      "Zoom in should enlarge the board",
+    );
+
+    await host.getByRole("button", { name: "Show reference picture" }).click();
+    await host.locator('[data-testid="reference-image"]').waitFor({ state: "visible" });
+    await host.getByRole("button", { name: "Hide reference picture" }).click();
+    await host.locator('[data-testid="reference-image"]').waitFor({ state: "hidden" });
+
+    const panBefore = await board.boundingBox();
+    assert(panBefore, "Zoomed board should have a measurable box");
+    await host.mouse.move(
+      panBefore.x + panBefore.width / 2,
+      panBefore.y + panBefore.height / 2,
+    );
+    await host.mouse.down();
+    await host.mouse.move(
+      panBefore.x + panBefore.width / 2 + 42,
+      panBefore.y + panBefore.height / 2 + 24,
+      { steps: 5 },
+    );
+    await host.mouse.up();
+    await host.waitForTimeout(100);
+    const panAfter = await board.boundingBox();
+    assert(panAfter && Math.abs(panAfter.x - panBefore.x) > 5, "Dragging should pan the board");
+
+    await host.getByRole("button", { name: "Reset board view" }).click();
+    await host.waitForTimeout(120);
+    const resetBoardBox = await board.boundingBox();
+    assert(
+      resetBoardBox && Math.abs(resetBoardBox.width - baseBoardBox.width) < 2,
+      "Reset should restore the fitted board size",
+    );
+
+    await host.getByTestId("tray-filter-corners").click();
+    assert(
+      (await host.getByTestId("tray-filter-corners").getAttribute("aria-pressed")) === "true",
+      "Corner filter should be active",
+    );
+    const cornerTrayCount = await host.locator('[data-testid^="tray-piece-"]').count();
+    assert(cornerTrayCount > 0 && cornerTrayCount <= 4, "Corner filter should show at most four pieces");
+    await host.getByTestId("tray-filter-all").click();
+    assert(
+      (await host.locator('[data-testid^="tray-piece-"]').count()) === 24,
+      "Clearing the filter should show all loose pieces",
+    );
+    log("zoom, pan, reference toggle and tray filters work");
+
+    // --- Connection drop while holding a piece ----------------------------
+    const interrupted = await firstTrayPiece(host);
+    await host.mouse.move(interrupted.start.x, interrupted.start.y);
+    await host.mouse.down();
+    for (let step = 1; step <= 10; step++) {
+      await host.mouse.move(
+        interrupted.start.x + ((interrupted.target.x - interrupted.start.x) * step) / 10,
+        interrupted.start.y + ((interrupted.target.y - interrupted.start.y) * step) / 10,
+      );
+      await host.waitForTimeout(20);
+    }
+    await guest.locator('[data-testid="remote-drag"]').waitFor({ state: "visible", timeout: 5_000 });
+    await stopServer(server);
+    await host.getByText("Reconnecting").waitFor({ state: "visible", timeout: 12_000 });
+    server = launchServer(port, dataDir);
+    await waitForHealth(base);
+    await host.getByText("Live").waitFor({ state: "visible", timeout: 20_000 });
+    await guest.getByText("Live").waitFor({ state: "visible", timeout: 20_000 });
+    await guest.locator('[data-testid="remote-drag"]').waitFor({ state: "hidden", timeout: 15_000 });
+    await host.mouse.up();
+    await host.waitForTimeout(300);
+    await waitForHeaderProgress(host, "0/24 pieces");
+    assert(
+      (await host.locator(`[data-testid="${interrupted.testId}"]`).count()) === 1,
+      "A connection drop while holding a piece must not place it",
+    );
+    log("a server restart while holding a piece reconnected cleanly without a phantom placement");
+
     // --- Drag placement ----------------------------------------------------
     const hostPiece = await dragFirstPiece(host, "1/24 pieces", guest);
     await waitForHeaderProgress(guest, "1/24 pieces");
@@ -250,7 +440,7 @@ async function main() {
     await guest.reload({ waitUntil: "networkidle" });
     await guest.waitForSelector('[data-testid="puzzle-board"]');
     await waitForHeaderProgress(guest, "2/24 pieces");
-    await waitForHere(guest, 2);
+    await waitForHere(guest, 4);
     log("guest refresh re-joined automatically with placements intact");
 
     // --- Responsive layout -------------------------------------------------
@@ -328,20 +518,12 @@ async function main() {
     await guest.screenshot({ path: join(artifactsDir, "home-after-delete.png") });
 
     assert(consoleErrors.length === 0, `Browser errors:\n${consoleErrors.join("\n")}`);
-    console.log("\nE2E passed: create → join → presence → drag → tap → refresh → restart → delete");
+    console.log(
+      "\nE2E passed: create → join → four seats → QR → zoom/pan/filter → connection drop → drag → tap → refresh → restart → delete",
+    );
   } finally {
     if (browser) await browser.close().catch(() => {});
-    server.kill("SIGTERM");
-    await new Promise((resolveWait) => {
-      const timer = setTimeout(() => {
-        server.kill("SIGKILL");
-        resolveWait();
-      }, 4_000);
-      server.once("exit", () => {
-        clearTimeout(timer);
-        resolveWait();
-      });
-    });
+    await stopServer(server);
     await rm(dataDir, { recursive: true, force: true }).catch(() => {});
     if (consoleErrors.length > 0) {
       console.error("\nBrowser console errors:");

@@ -138,6 +138,11 @@ export type ServerMessage =
       players: PlayerDto[];
     }
   | {
+      type: "room_updated";
+      room: RoomDto;
+      players: PlayerDto[];
+    }
+  | {
       type: "room_deleted";
     }
   | {

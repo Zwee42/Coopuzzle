@@ -152,6 +152,8 @@ function messageToAction(message: ServerMessage): GameAction | null {
       };
     case "puzzle_started":
       return { type: "puzzle_started", room: message.room, players: message.players };
+    case "room_updated":
+      return { type: "room_updated", room: message.room, players: message.players };
     case "room_deleted":
       return { type: "deleted" };
     case "error":
