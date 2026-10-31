@@ -50,6 +50,17 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
+function isInteractiveTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    Boolean(
+      target.closest(
+        "button, a, input, select, textarea, [role='button'], [role='menuitem'], [contenteditable='true']",
+      ),
+    )
+  );
+}
+
 function piecePositionStyle(piece: PuzzlePiece, rows: number, cols: number) {
   const margin = PIECE_VIEWBOX_MARGIN;
   return {
@@ -222,12 +233,17 @@ export function PuzzleBoard({
           }
         }}
         onClick={(event) => {
+          if (isInteractiveTarget(event.target)) return;
           if (!selectedPiece || !onPlaceSelected) return;
           const point = boardPoint(event);
           if (point) onPlaceSelected(point);
         }}
-        onDoubleClick={() => resetView()}
+        onDoubleClick={(event) => {
+          if (isInteractiveTarget(event.target)) return;
+          resetView();
+        }}
         onPointerDown={(event) => {
+          if (isInteractiveTarget(event.target)) return;
           if (event.pointerType === "mouse" && event.button !== 0) return;
           try {
             event.currentTarget.setPointerCapture(event.pointerId);

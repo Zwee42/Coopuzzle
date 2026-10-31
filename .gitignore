@@ -9,6 +9,7 @@ data/
 .DS_Store
 test-results/
 playwright-report/
+e2e-output.log
 artifacts/
 .ownit/
 backups/

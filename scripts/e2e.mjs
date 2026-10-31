@@ -498,7 +498,11 @@ async function main() {
     await guest.getByText("Every piece found its home.").waitFor({ state: "visible" });
     await host.screenshot({ path: join(artifactsDir, "room-complete.png") });
     await host.getByRole("button", { name: "Admire it" }).click();
+    await host.getByText("Every piece found its home.").waitFor({ state: "hidden" });
     await guest.getByRole("button", { name: "Admire it" }).click();
+    await guest.getByText("Every piece found its home.").waitFor({ state: "hidden" });
+    await host.locator("header").getByText("Live", { exact: true }).waitFor();
+    await guest.locator("header").getByText("Live", { exact: true }).waitFor();
     log("all 12 pieces completed the puzzle and both players saw the celebration");
 
     // --- Delete as host ----------------------------------------------------

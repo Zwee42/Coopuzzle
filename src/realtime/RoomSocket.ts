@@ -6,6 +6,7 @@ interface RoomSocketOptions {
   token: string;
   onMessage: (message: ServerMessage) => void;
   onStatus: (status: ConnectionState) => void;
+  onClose?: (code: number, reason: string) => void;
 }
 
 function socketUrl(): string {
@@ -98,6 +99,7 @@ export class RoomSocket {
     ws.addEventListener("close", (event) => {
       if (this.ws !== ws) return;
       this.ws = null;
+      this.options.onClose?.(event.code, event.reason);
       if (this.stopped) {
         this.options.onStatus("closed");
         return;

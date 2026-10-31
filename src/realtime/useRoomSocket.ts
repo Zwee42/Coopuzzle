@@ -17,6 +17,11 @@ export function useRoomSocket({ code, token }: UseRoomSocketInput) {
       code,
       token,
       onStatus: (connection) => dispatch({ type: "connection", connection }),
+      onClose: (code) => {
+        // The server closes with 4001 after a room is deleted. If the
+        // room_deleted message was lost, this still sends everyone home.
+        if (code === 4001) dispatch({ type: "deleted" });
+      },
       onMessage: (message) => {
         const action = messageToAction(message);
         if (action) dispatch(action);

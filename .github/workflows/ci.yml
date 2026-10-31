@@ -42,13 +42,23 @@ jobs:
         run: npm run build
 
       - name: Multi-browser end-to-end test
-        run: node scripts/e2e.mjs
+        run: |
+          set +e
+          node scripts/e2e.mjs 2>&1 | tee e2e-output.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            message=$(tail -n 40 e2e-output.log | tr '\n' ' ' | sed 's/%/%25/g; s/\r/%0D/g')
+            echo "::error title=E2E failure::$message"
+          fi
+          exit "$status"
 
       - name: Upload failure artifacts
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
-          path: test-results/
+          path: |
+            test-results/
+            e2e-output.log
           if-no-files-found: ignore
           retention-days: 7
